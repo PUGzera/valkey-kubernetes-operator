@@ -1,0 +1,56 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.1
+  name: valkeyclusters.valkey.my.domain
+spec:
+  group: valkey.my.domain
+  names:
+    kind: ValkeyCluster
+    listKind: ValkeyClusterList
+    plural: valkeyclusters
+    singular: valkeycluster
+  scope: Namespaced
+  versions:
+  - name: v1
+    schema:
+      openAPIV3Schema:
+        description: ValkeyCluster is the Schema for the valkeyclusters API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ValkeyClusterSpec defines the desired state of ValkeyCluster
+            properties:
+              masters:
+                description: Foo is an example field of ValkeyCluster. Edit valkeycluster_types.go
+                  to remove/update
+                type: integer
+              replications:
+                type: integer
+            type: object
+          status:
+            description: ValkeyClusterStatus defines the observed state of ValkeyCluster
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

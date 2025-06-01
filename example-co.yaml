@@ -1,0 +1,10 @@
+apiVersion: valkey.my.domain/v1
+kind: ValkeyCluster
+metadata:
+  labels:
+    app.kubernetes.io/name: valkey-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: valkeycluster-sample
+spec:
+  masters: 1
+  replications: 2
