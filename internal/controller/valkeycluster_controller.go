@@ -17,7 +17,6 @@ limitations under the License.
 package controller
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -25,21 +24,17 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/remotecommand"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	valkeyv1 "valkey-operator/api/v1"
-
-	corev1 "k8s.io/api/core/v1"
 )
 
 // ValkeyClusterReconciler reconciles a ValkeyCluster object
@@ -47,27 +42,6 @@ type ValkeyClusterReconciler struct {
 	client.Client
 	Scheme    *runtime.Scheme
 	ClientSet *kubernetes.Clientset
-	State     ValkeyClusterState
-	Config    *rest.Config
-}
-
-type ClusterState = []ValkeyClusterNode
-
-type ValkeyClusterState struct {
-	Nodes        map[string]*valkeyv1.ValkeyNode
-	ClusterState ClusterState
-}
-
-type ValkeyClusterNode struct {
-	ID           string   `json:"id"`
-	Address      string   `json:"address"`
-	Flags        []string `json:"flags"`
-	Master       string   `json:"master"`
-	PingSent     string   `json:"ping_sent"`
-	PongReceived string   `json:"pong_received"`
-	ConfigEpoch  string   `json:"config_epoch"`
-	LinkState    string   `json:"link_state"`
-	Slots        string   `json:"slots,omitempty"`
 }
 
 // +kubebuilder:rbac:groups=valkey.my.domain,resources=valkeyclusters,verbs=get;list;watch;create;update;patch;delete
@@ -88,223 +62,183 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	logger.Info("Start reconcile...")
 
 	valkeyCluster := &valkeyv1.ValkeyCluster{}
+
+	logger.Info("Fetching ValkeyCluster")
 	err := r.Get(ctx, req.NamespacedName, valkeyCluster)
 	if err != nil {
-		logger.Error(err, "failed to get ValkeyCluster")
-		return ctrl.Result{Requeue: false}, err
+		logger.Error(err, "Failed to get Valkey Cluster info")
+		return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 10}, err
 	}
 
-	if valkeyCluster.Generation == valkeyCluster.Status.ObservedGeneration {
-		logger.Info(
-			fmt.Sprintf(
-				"No update to CO, ObservedGeneration: %d, Generation: %d",
-				valkeyCluster.Status.ObservedGeneration,
-				valkeyCluster.Generation,
-			),
-		)
-		return ctrl.Result{Requeue: false}, nil
-	}
-
+	logger.Info(fmt.Sprintf("Found ValkeyCluster %+v", valkeyCluster))
 	masters := valkeyCluster.Spec.Masters
+	replication := valkeyCluster.Spec.Replications
 
 	for range masters {
-		nodeName := fmt.Sprintf("valkey-node-%s", uuid.New().String())
-		valkeyNode := &valkeyv1.ValkeyNode{
-			ObjectMeta: v1.ObjectMeta{
-				Name:      nodeName,
-				Namespace: req.Namespace,
-				OwnerReferences: []v1.OwnerReference{
-					{
-						APIVersion: valkeyCluster.APIVersion,
-						Kind:       valkeyCluster.Kind,
-						Name:       valkeyCluster.Name,
-						UID:        valkeyCluster.UID,
-					},
-				},
-				Labels: map[string]string{
-					"owner": valkeyCluster.Name,
-				},
-			},
-			Spec: valkeyv1.ValkeyNodeSpec{
-				Replicas: valkeyCluster.Spec.Replications,
-			},
-		}
-		err = r.Create(ctx, valkeyNode)
+		name := fmt.Sprintf("valkey-deployment-%s", uuid.New().String())
+		deplTemplate := r.generateValkeyDeployment(name, replication)
+		logger.Info(fmt.Sprintf("Creating valkey deployment %s", name))
+		err = r.createValkeyDeployment(deplTemplate, req.Namespace, ctx)
 		if err != nil {
-			logger.Error(err, "failed to create ValkeyNode")
-			return ctrl.Result{Requeue: false}, err
+			logger.Error(err, "Failed to create valkey deployment")
+			return ctrl.Result{Requeue: true, RequeueAfter: time.Minute * 5}, err
 		}
-
-		r.State.Nodes[valkeyNode.Name] = valkeyNode
-	}
-
-	masterPodIPs := make([]string, len(r.State.Nodes))
-	var randomNode *valkeyv1.ValkeyNode
-
-	for _, valkeyNode := range r.State.Nodes {
-		newValkeyNode, err := r.waitForNodeToBeReady(valkeyNode, time.Minute*5, ctx)
+		err = r.waitForDeploymentReady(req.Namespace, name, time.Minute*5, ctx)
 		if err != nil {
-			logger.Error(err, "waiting for valkeyNode to be ready timed out")
-			return ctrl.Result{Requeue: false}, err
+			logger.Error(err, "deployment failed to get ready")
+			return ctrl.Result{Requeue: true, RequeueAfter: time.Minute * 5}, err
 		}
-		r.State.Nodes[valkeyNode.Name] = newValkeyNode
-		masterPodIPs = append(masterPodIPs, newValkeyNode.Status.NodeState.Master.PodIP+":6379")
-		if randomNode == nil {
-			randomNode = newValkeyNode
+		err = r.labelValkeyDeployment(name, req.Namespace, ctx)
+		if err != nil {
+			logger.Error(err, "failed to label valkey pods")
+			return ctrl.Result{Requeue: false, RequeueAfter: time.Minute * 5}, err
 		}
+		masterIP, replicaIPs, err := r.getValkeyDeploymentIPs(name, req.Namespace, ctx)
+		if err != nil {
+			logger.Error(err, "failed to get valkey pod IPs")
+			return ctrl.Result{Requeue: true, RequeueAfter: time.Minute * 5}, err
+		}
+		logger.Info(masterIP)
+		logger.Info(fmt.Sprintf("%+v", replicaIPs))
 	}
 
-	logger.Info(fmt.Sprintf("IPs %+v", masterPodIPs))
-
-	err = r.createCluster(randomNode.Status.NodeState.Master.PodName, req.Namespace, ctx, masterPodIPs)
-	if err != nil {
-		logger.Error(err, "failed to create Cluster")
-		return ctrl.Result{Requeue: false}, err
-	}
-
-	clusterState, err := r.getClusterNodes(randomNode.Status.NodeState.Master.PodName, req.Namespace, ctx)
-	if err != nil {
-		logger.Error(err, "failed to get cluster nodes")
-		return ctrl.Result{Requeue: false}, err
-	}
-
-	r.State.ClusterState = clusterState
-
-	logger.Info(fmt.Sprintf("CLUSTER STATE %+v", clusterState))
-
-	valkeyCluster.Status.ObservedGeneration = valkeyCluster.Generation
-
-	err = r.Status().Update(ctx, valkeyCluster)
-	if err != nil {
-		logger.Error(err, "failed to update valkey cluster status")
-		return ctrl.Result{Requeue: false}, err
-	}
-
-	return ctrl.Result{Requeue: false}, nil
+	return ctrl.Result{}, nil
 }
 
-func (r *ValkeyClusterReconciler) waitForNodeToBeReady(valkeyNode *valkeyv1.ValkeyNode, timeout time.Duration, ctx context.Context) (*valkeyv1.ValkeyNode, error) {
-	err := wait.PollUntilContextTimeout(ctx, 2*time.Second, timeout, true, func(context.Context) (bool, error) {
-		newValkeyNode := &valkeyv1.ValkeyNode{}
-		namespacedName := types.NamespacedName{
-			Name:      valkeyNode.Name,
-			Namespace: valkeyNode.Namespace,
+func (r *ValkeyClusterReconciler) getDeploymentPods(deplName, namespace string, ctx context.Context) (*corev1.PodList, error) {
+	depl, err := r.ClientSet.AppsV1().Deployments(namespace).Get(ctx, deplName, v1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	selector, ok := depl.Spec.Selector.MatchLabels["app"]
+	if !ok {
+		return nil, errors.New("unable to get labelselector \"app\"")
+	}
+	return r.ClientSet.CoreV1().Pods(namespace).List(ctx, v1.ListOptions{LabelSelector: fmt.Sprintf("app=%s", selector)})
+}
+
+func (r *ValkeyClusterReconciler) getValkeyDeploymentIPs(deplName, namespace string, ctx context.Context) (string, []string, error) {
+	pods, err := r.getDeploymentPods(deplName, namespace, ctx)
+	if err != nil {
+		return "", nil, err
+	}
+
+	if len(pods.Items) < 1 {
+		return "", nil, errors.New("Too few pods in Master Replica deployment")
+	}
+
+	var masterIP string
+	var replicaIPs []string
+
+	for _, pod := range pods.Items {
+		if strings.EqualFold(pod.Labels["valkey-role"], "master") {
+			masterIP = pod.Status.PodIP
+		} else {
+			replicaIPs = append(replicaIPs, pod.Status.PodIP)
 		}
-		err := r.Get(ctx, namespacedName, newValkeyNode)
+	}
+
+	return masterIP, replicaIPs, nil
+}
+
+func (r *ValkeyClusterReconciler) labelValkeyDeployment(deplName, namespace string, ctx context.Context) error {
+	pods, err := r.getDeploymentPods(deplName, namespace, ctx)
+	if err != nil {
+		return err
+	}
+
+	if len(pods.Items) < 1 {
+		return errors.New("Too few pods in Master Replica deployment")
+	}
+
+	master := pods.Items[0]
+	replicas := pods.Items[1:]
+
+	master.ObjectMeta.Labels["valkey-role"] = "master"
+	_, err = r.ClientSet.CoreV1().Pods(namespace).Update(ctx, &master, v1.UpdateOptions{})
+	if err != nil {
+		return err
+	}
+
+	for _, replica := range replicas {
+		replica.ObjectMeta.Labels["valkey-role"] = "replica"
+		_, err = r.ClientSet.CoreV1().Pods(namespace).Update(ctx, &replica, v1.UpdateOptions{})
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (r *ValkeyClusterReconciler) generateValkeyDeployment(name string, replication int) appsv1.Deployment {
+	replicas := int32(replication + 1)
+	return appsv1.Deployment{
+		ObjectMeta: v1.ObjectMeta{
+			Name: name,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &v1.LabelSelector{
+				MatchLabels: map[string]string{
+					"type": "valkey-deployment",
+					"app":  name,
+				},
+			},
+			Replicas: &replicas,
+			Template: r.generateValkeyPodTemplate(name),
+		},
+	}
+}
+
+func (r *ValkeyClusterReconciler) generateValkeyPodTemplate(app string) corev1.PodTemplateSpec {
+	return corev1.PodTemplateSpec{
+		ObjectMeta: v1.ObjectMeta{
+			Labels: map[string]string{
+				"type": "valkey-deployment",
+				"app":  app,
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "valkey-server",
+					Image: "valkey/valkey:latest",
+					Ports: []corev1.ContainerPort{
+						{
+							ContainerPort: 6379,
+						},
+					},
+					Command: []string{"valkey-server"},
+					Args: []string{
+						"--cluster-enabled", "yes",
+						"--cluster-config-file", "nodes.conf",
+						"--cluster-node-timeout", "5000",
+						"--appendonly", "yes",
+					},
+				},
+			},
+		},
+	}
+}
+
+func (r *ValkeyClusterReconciler) createValkeyDeployment(depl appsv1.Deployment, namespace string, ctx context.Context) error {
+	_, err := r.ClientSet.AppsV1().Deployments(namespace).Create(ctx, &depl, v1.CreateOptions{})
+	return err
+}
+
+func (r *ValkeyClusterReconciler) waitForDeploymentReady(namespace, deploymentName string, timeout time.Duration, ctx context.Context) error {
+	return wait.PollUntilContextTimeout(ctx, 2*time.Second, timeout, true, func(context.Context) (bool, error) {
+		deploy, err := r.ClientSet.AppsV1().Deployments(namespace).Get(ctx, deploymentName, v1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
 
-		if newValkeyNode.Generation == newValkeyNode.Status.ObservedGeneration {
+		if deploy.Status.ReadyReplicas == *deploy.Spec.Replicas {
 			return true, nil
 		}
 
 		return false, nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	newValkeyNode := &valkeyv1.ValkeyNode{}
-	namespacedName := types.NamespacedName{
-		Name:      valkeyNode.Name,
-		Namespace: valkeyNode.Namespace,
-	}
-	err = r.Get(ctx, namespacedName, newValkeyNode)
-	if err != nil {
-		return nil, err
-	}
-
-	return newValkeyNode, nil
-}
-
-func (r *ValkeyClusterReconciler) createCluster(podName, namespace string, ctx context.Context, addresses []string) error {
-	_, err := r.valkeyCommand(podName, namespace, "--cluster", append([]string{"create", "--cluster-yes"}, addresses...), ctx)
-	return err
-}
-
-func (r *ValkeyClusterReconciler) getClusterNodes(podName, namespace string, ctx context.Context) (ClusterState, error) {
-	stdout, err := r.valkeyCommand(podName, namespace, "cluster", []string{"nodes"}, ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	logger := log.FromContext(ctx)
-
-	lines := strings.Split(strings.TrimSpace(stdout), "\n")
-
-	logger.Info(fmt.Sprintf("LINES %+v", lines))
-
-	var clusterState ClusterState
-
-	for _, line := range lines {
-		parts := strings.Fields(line)
-		logger.Info(fmt.Sprintf("PARTS %+v", parts))
-		if len(parts) < 10 {
-			return nil, errors.New("malformed cluster state data received")
-		}
-
-		node := ValkeyClusterNode{
-			ID:           parts[0],
-			Address:      strings.Split(parts[1], ":")[0],
-			Flags:        strings.Split(parts[2], ","),
-			Master:       parts[3],
-			PingSent:     parts[4],
-			PongReceived: parts[5],
-			ConfigEpoch:  parts[6],
-			LinkState:    parts[7],
-		}
-
-		if len(parts) > 8 {
-			node.Slots = strings.Join(parts[8:], " ")
-		}
-
-		clusterState = append(clusterState, node)
-	}
-
-	return clusterState, nil
-}
-
-func (r *ValkeyClusterReconciler) valkeyCommand(podName, namespace, operation string, flags []string, ctx context.Context) (string, error) {
-	logger := log.FromContext(ctx)
-	binary := "valkey-cli"
-	command := []string{binary, operation}
-	command = append(command, flags...)
-
-	logger.Info(fmt.Sprintf("COMMAND %+v", command))
-
-	req := r.ClientSet.CoreV1().RESTClient().
-		Post().
-		Resource("pods").
-		Name(podName).
-		Namespace(namespace).
-		SubResource("exec").
-		VersionedParams(&corev1.PodExecOptions{
-			Command:   []string{"/bin/bash", "-c", strings.Join(command, " ")},
-			Container: "valkey-server",
-			Stdin:     false,
-			Stdout:    true,
-			Stderr:    true,
-			TTY:       false,
-		}, scheme.ParameterCodec)
-
-	// Create executor
-	exec, err := remotecommand.NewSPDYExecutor(r.Config, "POST", req.URL())
-	if err != nil {
-		return "", err
-	}
-
-	var stdout, stderr strings.Builder
-	err = exec.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdout: bufio.NewWriter(&stdout),
-		Stderr: bufio.NewWriter(&stderr),
-	})
-	if err != nil {
-		logger.Info("STDERR" + stderr.String())
-		return "", err
-	}
-	logger.Info("STDOUT" + stdout.String())
-	logger.Info("STDERR" + stderr.String())
-	return stdout.String(), nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

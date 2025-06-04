@@ -8,7 +8,6 @@ rules:
   - valkey.my.domain
   resources:
   - valkeyclusters
-  - valkeynodes
   verbs:
   - create
   - delete
@@ -21,14 +20,12 @@ rules:
   - valkey.my.domain
   resources:
   - valkeyclusters/finalizers
-  - valkeynodes/finalizers
   verbs:
   - update
 - apiGroups:
   - valkey.my.domain
   resources:
   - valkeyclusters/status
-  - valkeynodes/status
   verbs:
   - get
   - patch
