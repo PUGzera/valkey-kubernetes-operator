@@ -53,25 +53,25 @@ type ValkeyClusterReconciler struct {
 	Config    *rest.Config
 }
 
-type ClusterState = []ValkeyClusterNode
+type ClusterState = map[string]ValkeyClusterNode
 
 type ValkeyClusterState struct {
 	Cluster      *valkeyv1.ValkeyCluster
 	StatefulSet  *appsv1.StatefulSet
-	ClusterState *ClusterState
+	ClusterState ClusterState
 }
 
 type ValkeyClusterNode struct {
-	ID           string   `json:"id"`
-	Address      string   `json:"address"`
-	IP           string   `json:"ip"`
-	Flags        []string `json:"flags"`
-	Master       string   `json:"master"`
-	PingSent     string   `json:"ping_sent"`
-	PongReceived string   `json:"pong_received"`
-	ConfigEpoch  string   `json:"config_epoch"`
-	LinkState    string   `json:"link_state"`
-	Slots        string   `json:"slots,omitempty"`
+	ID           string `json:"id"`
+	Address      string `json:"address"`
+	IP           string `json:"ip"`
+	Role         string `json:"role"`
+	Master       string `json:"master"`
+	PingSent     string `json:"ping_sent"`
+	PongReceived string `json:"pong_received"`
+	ConfigEpoch  string `json:"config_epoch"`
+	LinkState    string `json:"link_state"`
+	Slots        string `json:"slots,omitempty"`
 }
 
 // +kubebuilder:rbac:groups=valkey.my.domain,resources=valkeyclusters,verbs=get;list;watch;create;update;patch;delete
@@ -116,14 +116,49 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{Requeue: false}, err
 	}
 
-	clusterState, err := r.getClusterNodes(ctx)
+	clusterState, err := r.getClusterState(ctx)
 
-	logger.Info(fmt.Sprintf("CLUSTER STATE %+v", clusterState))
+	if err != nil {
+		return ctrl.Result{Requeue: false}, err
+	}
+
+	r.State.ClusterState = clusterState
+
+	err = r.updateClusterCustomResource(ctx, true)
+
 	if err != nil {
 		return ctrl.Result{Requeue: false}, err
 	}
 
 	return ctrl.Result{Requeue: false}, nil
+}
+
+func (r *ValkeyClusterReconciler) updateClusterCustomResource(ctx context.Context, success bool) error {
+	valkeyCluster := r.State.Cluster
+	var valkeyNodes []valkeyv1.ValkeyNode
+
+	for podName, node := range r.State.ClusterState {
+		valkeyNode := valkeyv1.ValkeyNode{
+			Role:      node.Role,
+			Master:    node.Master,
+			Address:   node.Address,
+			PodName:   podName,
+			ClusterId: node.ID,
+			Slots:     node.Slots,
+		}
+		valkeyNodes = append(valkeyNodes, valkeyNode)
+	}
+	valkeyStatus := valkeyv1.ValkeyClusterStatus{
+		ValkeyNodes: valkeyNodes,
+	}
+
+	if success {
+		valkeyStatus.ObservedGeneration = valkeyCluster.Generation
+	}
+
+	valkeyCluster.Status = valkeyStatus
+
+	return r.Status().Update(ctx, valkeyCluster)
 }
 
 func (r *ValkeyClusterReconciler) createCluster(ctx context.Context) error {
@@ -148,7 +183,7 @@ func (r *ValkeyClusterReconciler) getValkeyNodeAddresses(ctx context.Context, wi
 
 	addresses := make([]string, len(pods.Items))
 	for i, pod := range pods.Items {
-		address := fmt.Sprintf("%s.%s.%s.svc.cluster.local", pod.Name, r.State.Cluster.Name, r.State.Cluster.Namespace)
+		address := r.getFQDNFromPodName(pod.Name)
 		if withPort {
 			address = address + ":" + strconv.Itoa(int(r.State.Cluster.Spec.Port))
 		}
@@ -156,6 +191,10 @@ func (r *ValkeyClusterReconciler) getValkeyNodeAddresses(ctx context.Context, wi
 	}
 
 	return addresses, nil
+}
+
+func (r *ValkeyClusterReconciler) getFQDNFromPodName(podName string) string {
+	return fmt.Sprintf("%s.%s.%s.svc.cluster.local", podName, r.State.Cluster.Name, r.State.Cluster.Namespace)
 }
 
 func (r *ValkeyClusterReconciler) getValkeyNodePods(ctx context.Context) (*corev1.PodList, error) {
@@ -249,10 +288,15 @@ func (r *ValkeyClusterReconciler) valkeyStatefulSetTemplate() appsv1.StatefulSet
 
 func (r *ValkeyClusterReconciler) valkeyPodTemplate(name string) corev1.PodTemplateSpec {
 	podTemplate := r.State.Cluster.Spec.PodTemplate
+	if podTemplate == nil {
+		podTemplate = &corev1.PodTemplateSpec{}
+	}
+
 	if podTemplate.ObjectMeta.Labels == nil {
 		podTemplate.ObjectMeta.Labels = make(map[string]string)
 	}
 	podTemplate.ObjectMeta.Labels["app"] = name
+
 	valkeyVersion := r.State.Cluster.Spec.ValkeyVersion
 	if strings.EqualFold(valkeyVersion, "") {
 		valkeyVersion = "latest"
@@ -304,7 +348,7 @@ func (r *ValkeyClusterReconciler) valkeyPodTemplate(name string) corev1.PodTempl
 					"--appendonly", "yes",
 					"--port", strconv.Itoa(int(r.State.Cluster.Spec.Port)),
 					"--cluster-announce-hostname",
-					fmt.Sprintf("${HOSTNAME}.%s.%s.svc.cluster.local", name, r.State.Cluster.Namespace),
+					r.getFQDNFromPodName("${HOSTNAME}"),
 				}, " "),
 			},
 		}
@@ -320,7 +364,8 @@ func (r *ValkeyClusterReconciler) valkeyPodTemplate(name string) corev1.PodTempl
 	podTemplate.Spec.Containers = []corev1.Container{
 		containerSpec,
 	}
-	return podTemplate
+
+	return *podTemplate
 }
 
 func (r *ValkeyClusterReconciler) valkeyServiceTemplate() corev1.Service {
@@ -381,7 +426,7 @@ func (r *ValkeyClusterReconciler) createValkeyCluster(ctx context.Context) error
 	return err
 }
 
-func (r *ValkeyClusterReconciler) getClusterNodes(ctx context.Context) (ClusterState, error) {
+func (r *ValkeyClusterReconciler) getClusterState(ctx context.Context) (ClusterState, error) {
 	pods, err := r.getValkeyNodePods(ctx)
 	if err != nil || len(pods.Items) < 1 {
 		return nil, errors.New("failed to get valkey pods")
@@ -396,7 +441,7 @@ func (r *ValkeyClusterReconciler) getClusterNodes(ctx context.Context) (ClusterS
 
 	lines := strings.Split(strings.TrimSpace(stdout), "\n")
 
-	var clusterState ClusterState
+	clusterState := make(ClusterState)
 
 	for _, line := range lines {
 		parts := strings.Fields(line)
@@ -408,19 +453,22 @@ func (r *ValkeyClusterReconciler) getClusterNodes(ctx context.Context) (ClusterS
 			ID:           parts[0],
 			Address:      strings.Split(parts[1], ",")[1],
 			IP:           strings.Split(parts[1], ":")[0],
-			Flags:        strings.Split(parts[2], ","),
+			Role:         strings.Split(parts[2], "myself,")[0],
 			Master:       parts[3],
 			PingSent:     parts[4],
 			PongReceived: parts[5],
 			ConfigEpoch:  parts[6],
 			LinkState:    parts[7],
+			Slots:        "",
 		}
 
 		if len(parts) == 9 {
 			node.Slots = strings.Join(parts[8:], " ")
 		}
 
-		clusterState = append(clusterState, node)
+		host := strings.Split(node.Address, ".")[0]
+
+		clusterState[host] = node
 	}
 
 	return clusterState, nil

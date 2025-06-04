@@ -8103,6 +8103,8 @@ spec:
                       type: string
                     clusterId:
                       type: string
+                    master:
+                      type: string
                     podName:
                       type: string
                     role:
@@ -8112,6 +8114,7 @@ spec:
                   required:
                   - address
                   - clusterId
+                  - master
                   - podName
                   - role
                   - slots

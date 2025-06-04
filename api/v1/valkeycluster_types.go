@@ -30,12 +30,12 @@ type ValkeyClusterSpec struct {
 	// Important: Run "make" to regenerate code after modifying this file
 
 	// Foo is an example field of ValkeyCluster. Edit valkeycluster_types.go to remove/update
-	Masters             int                    `json:"masters"`
-	Replications        int                    `json:"replications"`
-	Port                int32                  `json:"port,omitempty"`
-	ValkeyVersion       string                 `json:"valkeyVersion,omitempty"`
-	PodTemplate         corev1.PodTemplateSpec `json:"podTemplate"`
-	ValkeyConfigMapName string                 `json:"valkeyConfigMapName,omitempty"`
+	Masters             int                     `json:"masters"`
+	Replications        int                     `json:"replications"`
+	Port                int32                   `json:"port,omitempty"`
+	ValkeyVersion       string                  `json:"valkeyVersion,omitempty"`
+	PodTemplate         *corev1.PodTemplateSpec `json:"podTemplate,omitempty"`
+	ValkeyConfigMapName string                  `json:"valkeyConfigMapName,omitempty"`
 }
 
 // ValkeyClusterStatus defines the observed state of ValkeyCluster
@@ -43,11 +43,12 @@ type ValkeyClusterStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 	ObservedGeneration int64        `json:"observedGeneration"`
-	ValkeyNodes        []ValkeyNode `json:"valkeyNodes"`
+	ValkeyNodes        []ValkeyNode `json:"valkeyNodes,omitempty"`
 }
 
 type ValkeyNode struct {
 	Role      string `json:"role"`
+	Master    string `json:"master"`
 	Address   string `json:"address"`
 	PodName   string `json:"podName"`
 	ClusterId string `json:"clusterId"`
