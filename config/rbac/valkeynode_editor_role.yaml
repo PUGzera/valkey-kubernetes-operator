@@ -1,13 +1,15 @@
----
+# permissions for end users to edit valkeynodes.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: manager-role
+  labels:
+    app.kubernetes.io/name: valkey-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: valkeynode-editor-role
 rules:
 - apiGroups:
   - valkey.my.domain
   resources:
-  - valkeyclusters
   - valkeynodes
   verbs:
   - create
@@ -20,16 +22,6 @@ rules:
 - apiGroups:
   - valkey.my.domain
   resources:
-  - valkeyclusters/finalizers
-  - valkeynodes/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - valkey.my.domain
-  resources:
-  - valkeyclusters/status
   - valkeynodes/status
   verbs:
   - get
-  - patch
-  - update

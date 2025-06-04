@@ -23,44 +23,55 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
-// ValkeyClusterSpec defines the desired state of ValkeyCluster
-type ValkeyClusterSpec struct {
+// ValkeyNodeSpec defines the desired state of ValkeyNode
+type ValkeyNodeSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
-	// Foo is an example field of ValkeyCluster. Edit valkeycluster_types.go to remove/update
-	Masters      int `json:"masters,omitempty"`
-	Replications int `json:"replications,omitempty"`
+	// Foo is an example field of ValkeyNode. Edit valkeynode_types.go to remove/update
+	Replicas int `json:"replicas,omitempty"`
 }
 
-// ValkeyClusterStatus defines the observed state of ValkeyCluster
-type ValkeyClusterStatus struct {
+// ValkeyNodeStatus defines the observed state of ValkeyNode
+type ValkeyNodeStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	ObservedGeneration int64 `json:"observedGeneration"`
+	ObservedGeneration int64           `json:"observedGeneration"`
+	NodeState          ValkeyNodeState `json:"nodeState"`
+}
+
+type ValkeyNodeState struct {
+	DeplName string      `json:"deployment"`
+	Master   ValkeyPod   `json:"master"`
+	Replicas []ValkeyPod `json:"replicas"`
+}
+
+type ValkeyPod struct {
+	PodName string `json:"pod"`
+	PodIP   string `json:"IP"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 
-// ValkeyCluster is the Schema for the valkeyclusters API
-type ValkeyCluster struct {
+// ValkeyNode is the Schema for the valkeynodes API
+type ValkeyNode struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   ValkeyClusterSpec   `json:"spec,omitempty"`
-	Status ValkeyClusterStatus `json:"status,omitempty"`
+	Spec   ValkeyNodeSpec   `json:"spec,omitempty"`
+	Status ValkeyNodeStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 
-// ValkeyClusterList contains a list of ValkeyCluster
-type ValkeyClusterList struct {
+// ValkeyNodeList contains a list of ValkeyNode
+type ValkeyNodeList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []ValkeyCluster `json:"items"`
+	Items           []ValkeyNode `json:"items"`
 }
 
 func init() {
-	SchemeBuilder.Register(&ValkeyCluster{}, &ValkeyClusterList{})
+	SchemeBuilder.Register(&ValkeyNode{}, &ValkeyNodeList{})
 }

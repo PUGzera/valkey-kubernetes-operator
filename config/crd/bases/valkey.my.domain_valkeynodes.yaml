@@ -4,20 +4,20 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.1
-  name: valkeyclusters.valkey.my.domain
+  name: valkeynodes.valkey.my.domain
 spec:
   group: valkey.my.domain
   names:
-    kind: ValkeyCluster
-    listKind: ValkeyClusterList
-    plural: valkeyclusters
-    singular: valkeycluster
+    kind: ValkeyNode
+    listKind: ValkeyNodeList
+    plural: valkeynodes
+    singular: valkeynode
   scope: Namespaced
   versions:
   - name: v1
     schema:
       openAPIV3Schema:
-        description: ValkeyCluster is the Schema for the valkeyclusters API
+        description: ValkeyNode is the Schema for the valkeynodes API
         properties:
           apiVersion:
             description: |-
@@ -37,18 +37,47 @@ spec:
           metadata:
             type: object
           spec:
-            description: ValkeyClusterSpec defines the desired state of ValkeyCluster
+            description: ValkeyNodeSpec defines the desired state of ValkeyNode
             properties:
-              masters:
-                description: Foo is an example field of ValkeyCluster. Edit valkeycluster_types.go
+              replicas:
+                description: Foo is an example field of ValkeyNode. Edit valkeynode_types.go
                   to remove/update
-                type: integer
-              replications:
                 type: integer
             type: object
           status:
-            description: ValkeyClusterStatus defines the observed state of ValkeyCluster
+            description: ValkeyNodeStatus defines the observed state of ValkeyNode
             properties:
+              nodeState:
+                properties:
+                  deployment:
+                    type: string
+                  master:
+                    properties:
+                      IP:
+                        type: string
+                      pod:
+                        type: string
+                    required:
+                    - IP
+                    - pod
+                    type: object
+                  replicas:
+                    items:
+                      properties:
+                        IP:
+                          type: string
+                        pod:
+                          type: string
+                      required:
+                      - IP
+                      - pod
+                      type: object
+                    type: array
+                required:
+                - deployment
+                - master
+                - replicas
+                type: object
               observedGeneration:
                 description: |-
                   INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
@@ -56,6 +85,7 @@ spec:
                 format: int64
                 type: integer
             required:
+            - nodeState
             - observedGeneration
             type: object
         type: object
