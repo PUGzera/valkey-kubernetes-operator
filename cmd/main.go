@@ -155,6 +155,8 @@ func main() {
 		Client:    mgr.GetClient(),
 		Scheme:    mgr.GetScheme(),
 		ClientSet: clientSet,
+		Config:    mgr.GetConfig(),
+		State:     controller.ValkeyClusterState{},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ValkeyCluster")
 		os.Exit(1)

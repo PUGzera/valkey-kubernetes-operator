@@ -31,12 +31,14 @@ type ValkeyClusterSpec struct {
 	// Foo is an example field of ValkeyCluster. Edit valkeycluster_types.go to remove/update
 	Masters      int `json:"masters,omitempty"`
 	Replications int `json:"replications,omitempty"`
+	//Port         int `json:"port,omitempty"`
 }
 
 // ValkeyClusterStatus defines the observed state of ValkeyCluster
 type ValkeyClusterStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
+	ObservedGeneration int64 `json:"observedGeneration"`
 }
 
 // +kubebuilder:object:root=true
