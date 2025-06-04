@@ -17,6 +17,7 @@ limitations under the License.
 package v1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -29,16 +30,28 @@ type ValkeyClusterSpec struct {
 	// Important: Run "make" to regenerate code after modifying this file
 
 	// Foo is an example field of ValkeyCluster. Edit valkeycluster_types.go to remove/update
-	Masters      int `json:"masters,omitempty"`
-	Replications int `json:"replications,omitempty"`
-	//Port         int `json:"port,omitempty"`
+	Masters             int                    `json:"masters"`
+	Replications        int                    `json:"replications"`
+	Port                int32                  `json:"port,omitempty"`
+	ValkeyVersion       string                 `json:"valkeyVersion,omitempty"`
+	PodTemplate         corev1.PodTemplateSpec `json:"podTemplate"`
+	ValkeyConfigMapName string                 `json:"valkeyConfigMapName,omitempty"`
 }
 
 // ValkeyClusterStatus defines the observed state of ValkeyCluster
 type ValkeyClusterStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	ObservedGeneration int64 `json:"observedGeneration"`
+	ObservedGeneration int64        `json:"observedGeneration"`
+	ValkeyNodes        []ValkeyNode `json:"valkeyNodes"`
+}
+
+type ValkeyNode struct {
+	Role      string `json:"role"`
+	Address   string `json:"address"`
+	PodName   string `json:"podName"`
+	ClusterId string `json:"clusterId"`
+	Slots     string `json:"slots"`
 }
 
 // +kubebuilder:object:root=true

@@ -18,6 +18,7 @@ package controller
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -58,12 +59,12 @@ type ValkeyClusterState struct {
 	Cluster      *valkeyv1.ValkeyCluster
 	StatefulSet  *appsv1.StatefulSet
 	ClusterState *ClusterState
-	Port         int32
 }
 
 type ValkeyClusterNode struct {
 	ID           string   `json:"id"`
 	Address      string   `json:"address"`
+	IP           string   `json:"ip"`
 	Flags        []string `json:"flags"`
 	Master       string   `json:"master"`
 	PingSent     string   `json:"ping_sent"`
@@ -109,11 +110,17 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	r.State.Cluster = valkeyCluster
-	r.State.Port = 6379
 
 	err = r.createCluster(ctx)
 	if err != nil {
-		return ctrl.Result{Requeue: false}, nil
+		return ctrl.Result{Requeue: false}, err
+	}
+
+	clusterState, err := r.getClusterNodes(ctx)
+
+	logger.Info(fmt.Sprintf("CLUSTER STATE %+v", clusterState))
+	if err != nil {
+		return ctrl.Result{Requeue: false}, err
 	}
 
 	return ctrl.Result{Requeue: false}, nil
@@ -143,7 +150,7 @@ func (r *ValkeyClusterReconciler) getValkeyNodeAddresses(ctx context.Context, wi
 	for i, pod := range pods.Items {
 		address := fmt.Sprintf("%s.%s.%s.svc.cluster.local", pod.Name, r.State.Cluster.Name, r.State.Cluster.Namespace)
 		if withPort {
-			address = address + ":" + strconv.Itoa(int(r.State.Port))
+			address = address + ":" + strconv.Itoa(int(r.State.Cluster.Spec.Port))
 		}
 		addresses[i] = address
 	}
@@ -241,33 +248,79 @@ func (r *ValkeyClusterReconciler) valkeyStatefulSetTemplate() appsv1.StatefulSet
 }
 
 func (r *ValkeyClusterReconciler) valkeyPodTemplate(name string) corev1.PodTemplateSpec {
-	return corev1.PodTemplateSpec{
-		ObjectMeta: v1.ObjectMeta{
-			Labels: map[string]string{
-				"app": name,
-			},
-		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:  "valkey-server",
-					Image: "valkey/valkey:latest",
-					Ports: []corev1.ContainerPort{
-						{
-							ContainerPort: r.State.Port,
-						},
+	podTemplate := r.State.Cluster.Spec.PodTemplate
+	if podTemplate.ObjectMeta.Labels == nil {
+		podTemplate.ObjectMeta.Labels = make(map[string]string)
+	}
+	podTemplate.ObjectMeta.Labels["app"] = name
+	valkeyVersion := r.State.Cluster.Spec.ValkeyVersion
+	if strings.EqualFold(valkeyVersion, "") {
+		valkeyVersion = "latest"
+	}
+
+	configFromConfigMap := !strings.EqualFold(r.State.Cluster.Spec.ValkeyConfigMapName, "")
+	valkeyConfigName := "valkey-config"
+	if configFromConfigMap {
+		mode := int32(0644)
+		configVolume := corev1.Volume{
+			Name: valkeyConfigName,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: r.State.Cluster.Spec.ValkeyConfigMapName,
 					},
-					Command: []string{"valkey-server"},
-					Args: []string{
-						"--cluster-enabled", "yes",
-						"--cluster-config-file", "nodes.conf",
-						"--cluster-node-timeout", "5000",
-						"--appendonly", "yes",
+					DefaultMode: &mode,
+				},
+			},
+		}
+		podTemplate.Spec.Volumes = append(podTemplate.Spec.Volumes, configVolume)
+	}
+	containerSpec :=
+		corev1.Container{
+			Name:  "valkey-server",
+			Image: fmt.Sprintf("valkey/valkey:%s", valkeyVersion),
+			Ports: []corev1.ContainerPort{
+				{
+					ContainerPort: r.State.Cluster.Spec.Port,
+				},
+			},
+			Env: []corev1.EnvVar{
+				{
+					Name: "HOSTNAME",
+					ValueFrom: &corev1.EnvVarSource{
+						FieldRef: &corev1.ObjectFieldSelector{
+							FieldPath: "metadata.name",
+						},
 					},
 				},
 			},
-		},
+			Command: []string{"/bin/bash", "-c"},
+			Args: []string{
+				strings.Join([]string{
+					"valkey-server",
+					"--cluster-enabled", "yes",
+					"--cluster-config-file", "nodes.conf",
+					"--cluster-node-timeout", "5000",
+					"--appendonly", "yes",
+					"--port", strconv.Itoa(int(r.State.Cluster.Spec.Port)),
+					"--cluster-announce-hostname",
+					fmt.Sprintf("${HOSTNAME}.%s.%s.svc.cluster.local", name, r.State.Cluster.Namespace),
+				}, " "),
+			},
+		}
+	if configFromConfigMap {
+		containerSpec.VolumeMounts = []corev1.VolumeMount{
+			{
+				ReadOnly:  true,
+				Name:      valkeyConfigName,
+				MountPath: "/data",
+			},
+		}
 	}
+	podTemplate.Spec.Containers = []corev1.Container{
+		containerSpec,
+	}
+	return podTemplate
 }
 
 func (r *ValkeyClusterReconciler) valkeyServiceTemplate() corev1.Service {
@@ -288,8 +341,8 @@ func (r *ValkeyClusterReconciler) valkeyServiceTemplate() corev1.Service {
 			Ports: []corev1.ServicePort{
 				{
 					Protocol:   corev1.ProtocolTCP,
-					Port:       r.State.Port,
-					TargetPort: intstr.FromInt32(r.State.Port),
+					Port:       r.State.Cluster.Spec.Port,
+					TargetPort: intstr.FromInt32(r.State.Cluster.Spec.Port),
 				},
 			},
 			Selector: map[string]string{
@@ -304,7 +357,7 @@ func (r *ValkeyClusterReconciler) valkeyServiceTemplate() corev1.Service {
 func (r *ValkeyClusterReconciler) createValkeyCluster(ctx context.Context) error {
 	pods, err := r.getValkeyNodePods(ctx)
 	if err != nil || len(pods.Items) < 1 {
-		return nil
+		return errors.New("failed to get valkey pods")
 	}
 
 	podName := pods.Items[0].Name
@@ -313,7 +366,7 @@ func (r *ValkeyClusterReconciler) createValkeyCluster(ctx context.Context) error
 	if err != nil {
 		return nil
 	}
-	_, err = r.valkeyCommand(
+	_, _, err = r.valkeyCommand(
 		podName,
 		"--cluster",
 		append(
@@ -328,30 +381,33 @@ func (r *ValkeyClusterReconciler) createValkeyCluster(ctx context.Context) error
 	return err
 }
 
-func (r *ValkeyClusterReconciler) getClusterNodes(podName, namespace string, ctx context.Context) (ClusterState, error) {
-	stdout, err := r.valkeyCommand(podName, "cluster", []string{"nodes"}, ctx)
+func (r *ValkeyClusterReconciler) getClusterNodes(ctx context.Context) (ClusterState, error) {
+	pods, err := r.getValkeyNodePods(ctx)
+	if err != nil || len(pods.Items) < 1 {
+		return nil, errors.New("failed to get valkey pods")
+	}
+
+	podName := pods.Items[0].Name
+
+	stdout, _, err := r.valkeyCommand(podName, "cluster", []string{"nodes"}, ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	logger := log.FromContext(ctx)
-
 	lines := strings.Split(strings.TrimSpace(stdout), "\n")
-
-	logger.Info(fmt.Sprintf("LINES %+v", lines))
 
 	var clusterState ClusterState
 
 	for _, line := range lines {
 		parts := strings.Fields(line)
-		logger.Info(fmt.Sprintf("PARTS %+v", parts))
-		if len(parts) < 10 {
+		if len(parts) < 8 || len(parts) > 9 {
 			return nil, errors.New("malformed cluster state data received")
 		}
 
 		node := ValkeyClusterNode{
 			ID:           parts[0],
-			Address:      strings.Split(parts[1], ":")[0],
+			Address:      strings.Split(parts[1], ",")[1],
+			IP:           strings.Split(parts[1], ":")[0],
 			Flags:        strings.Split(parts[2], ","),
 			Master:       parts[3],
 			PingSent:     parts[4],
@@ -360,7 +416,7 @@ func (r *ValkeyClusterReconciler) getClusterNodes(podName, namespace string, ctx
 			LinkState:    parts[7],
 		}
 
-		if len(parts) > 8 {
+		if len(parts) == 9 {
 			node.Slots = strings.Join(parts[8:], " ")
 		}
 
@@ -370,13 +426,10 @@ func (r *ValkeyClusterReconciler) getClusterNodes(podName, namespace string, ctx
 	return clusterState, nil
 }
 
-func (r *ValkeyClusterReconciler) valkeyCommand(podName, operation string, flags []string, ctx context.Context) (string, error) {
-	logger := log.FromContext(ctx)
+func (r *ValkeyClusterReconciler) valkeyCommand(podName, operation string, flags []string, ctx context.Context) (string, string, error) {
 	binary := "valkey-cli"
-	command := []string{binary, operation}
+	command := []string{binary, "-p", strconv.Itoa(int(r.State.Cluster.Spec.Port)), operation}
 	command = append(command, flags...)
-
-	logger.Info(fmt.Sprintf("COMMAND %+v", command))
 
 	req := r.ClientSet.CoreV1().RESTClient().
 		Post().
@@ -396,21 +449,19 @@ func (r *ValkeyClusterReconciler) valkeyCommand(podName, operation string, flags
 	// Create executor
 	exec, err := remotecommand.NewSPDYExecutor(r.Config, "POST", req.URL())
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	var stdout, stderr strings.Builder
+	var stdout, stderr bytes.Buffer
 	err = exec.StreamWithContext(ctx, remotecommand.StreamOptions{
 		Stdout: bufio.NewWriter(&stdout),
 		Stderr: bufio.NewWriter(&stderr),
 	})
 	if err != nil {
-		logger.Info("STDERR" + stderr.String())
-		return "", err
+		return "", "", errors.New(stderr.String())
 	}
-	logger.Info("STDOUT" + stdout.String())
-	logger.Info("STDERR" + stderr.String())
-	return stdout.String(), nil
+
+	return stdout.String(), stderr.String(), nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
