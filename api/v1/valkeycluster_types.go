@@ -38,12 +38,23 @@ type ValkeyClusterSpec struct {
 	ValkeyConfigMapName string                  `json:"valkeyConfigMapName,omitempty"`
 }
 
+type ValkeyClusterNode struct {
+	ID      string `json:"clusterId"`
+	Address string `json:"address"`
+	IP      string `json:"ip"`
+	Role    string `json:"role"`
+	Master  string `json:"master"`
+	Slots   string `json:"slots,omitempty"`
+}
+
+type ClusterState = map[string]ValkeyClusterNode
+
 // ValkeyClusterStatus defines the observed state of ValkeyCluster
 type ValkeyClusterStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	ObservedGeneration int64        `json:"observedGeneration"`
-	ValkeyNodes        []ValkeyNode `json:"valkeyNodes,omitempty"`
+	ObservedGeneration int64                        `json:"observedGeneration"`
+	ClusterState       map[string]ValkeyClusterNode `json:"clusterState,omitempty"`
 }
 
 type ValkeyNode struct {

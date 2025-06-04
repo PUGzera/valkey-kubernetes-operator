@@ -53,25 +53,10 @@ type ValkeyClusterReconciler struct {
 	Config    *rest.Config
 }
 
-type ClusterState = map[string]ValkeyClusterNode
-
 type ValkeyClusterState struct {
 	Cluster      *valkeyv1.ValkeyCluster
 	StatefulSet  *appsv1.StatefulSet
-	ClusterState ClusterState
-}
-
-type ValkeyClusterNode struct {
-	ID           string `json:"id"`
-	Address      string `json:"address"`
-	IP           string `json:"ip"`
-	Role         string `json:"role"`
-	Master       string `json:"master"`
-	PingSent     string `json:"ping_sent"`
-	PongReceived string `json:"pong_received"`
-	ConfigEpoch  string `json:"config_epoch"`
-	LinkState    string `json:"link_state"`
-	Slots        string `json:"slots,omitempty"`
+	ClusterState valkeyv1.ClusterState
 }
 
 // +kubebuilder:rbac:groups=valkey.my.domain,resources=valkeyclusters,verbs=get;list;watch;create;update;patch;delete
@@ -90,6 +75,14 @@ type ValkeyClusterNode struct {
 func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("Start reconcile...")
+
+	defer func() (ctrl.Result, error) {
+		if rec := recover(); rec != nil {
+			logger.Info("panic caused early exit of reconcile loop")
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, nil
+	}()
 
 	valkeyCluster := &valkeyv1.ValkeyCluster{}
 	err := r.Get(ctx, req.NamespacedName, valkeyCluster)
@@ -135,21 +128,9 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 func (r *ValkeyClusterReconciler) updateClusterCustomResource(ctx context.Context, success bool) error {
 	valkeyCluster := r.State.Cluster
-	var valkeyNodes []valkeyv1.ValkeyNode
 
-	for podName, node := range r.State.ClusterState {
-		valkeyNode := valkeyv1.ValkeyNode{
-			Role:      node.Role,
-			Master:    node.Master,
-			Address:   node.Address,
-			PodName:   podName,
-			ClusterId: node.ID,
-			Slots:     node.Slots,
-		}
-		valkeyNodes = append(valkeyNodes, valkeyNode)
-	}
 	valkeyStatus := valkeyv1.ValkeyClusterStatus{
-		ValkeyNodes: valkeyNodes,
+		ClusterState: r.State.ClusterState,
 	}
 
 	if success {
@@ -426,7 +407,7 @@ func (r *ValkeyClusterReconciler) createValkeyCluster(ctx context.Context) error
 	return err
 }
 
-func (r *ValkeyClusterReconciler) getClusterState(ctx context.Context) (ClusterState, error) {
+func (r *ValkeyClusterReconciler) getClusterState(ctx context.Context) (valkeyv1.ClusterState, error) {
 	pods, err := r.getValkeyNodePods(ctx)
 	if err != nil || len(pods.Items) < 1 {
 		return nil, errors.New("failed to get valkey pods")
@@ -441,7 +422,7 @@ func (r *ValkeyClusterReconciler) getClusterState(ctx context.Context) (ClusterS
 
 	lines := strings.Split(strings.TrimSpace(stdout), "\n")
 
-	clusterState := make(ClusterState)
+	clusterState := make(valkeyv1.ClusterState)
 
 	for _, line := range lines {
 		parts := strings.Fields(line)
@@ -449,17 +430,13 @@ func (r *ValkeyClusterReconciler) getClusterState(ctx context.Context) (ClusterS
 			return nil, errors.New("malformed cluster state data received")
 		}
 
-		node := ValkeyClusterNode{
-			ID:           parts[0],
-			Address:      strings.Split(parts[1], ",")[1],
-			IP:           strings.Split(parts[1], ":")[0],
-			Role:         strings.Split(parts[2], "myself,")[0],
-			Master:       parts[3],
-			PingSent:     parts[4],
-			PongReceived: parts[5],
-			ConfigEpoch:  parts[6],
-			LinkState:    parts[7],
-			Slots:        "",
+		node := valkeyv1.ValkeyClusterNode{
+			ID:      parts[0],
+			Address: strings.Split(parts[1], ",")[1],
+			IP:      strings.Split(parts[1], ":")[0],
+			Role:    strings.Split(parts[2], "myself,")[0],
+			Master:  parts[3],
+			Slots:   "",
 		}
 
 		if len(parts) == 9 {
