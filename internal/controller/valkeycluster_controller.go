@@ -22,10 +22,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/valkey-io/valkey-go"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -47,10 +49,11 @@ import (
 // ValkeyClusterReconciler reconciles a ValkeyCluster object
 type ValkeyClusterReconciler struct {
 	client.Client
-	Scheme    *runtime.Scheme
-	ClientSet *kubernetes.Clientset
-	State     ValkeyClusterState
-	Config    *rest.Config
+	Scheme       *runtime.Scheme
+	ClientSet    *kubernetes.Clientset
+	State        ValkeyClusterState
+	Config       *rest.Config
+	ValkeyClient valkey.Client
 }
 
 type ValkeyClusterState struct {
@@ -62,6 +65,10 @@ type ValkeyClusterState struct {
 // +kubebuilder:rbac:groups=valkey.my.domain,resources=valkeyclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=valkey.my.domain,resources=valkeyclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=valkey.my.domain,resources=valkeyclusters/finalizers,verbs=update
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=update;create;patch;get;delete
+// +kubebuilder:rbac:groups="",resources=services,verbs=update;create;patch;get;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=update;create;patch;get;delete;list
+// +kubebuilder:rbac:groups="",resources=pods/exec,verbs=update;create;patch;get;delete;list
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -75,14 +82,6 @@ type ValkeyClusterState struct {
 func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("Start reconcile...")
-
-	defer func() (ctrl.Result, error) {
-		if rec := recover(); rec != nil {
-			logger.Info("panic caused early exit of reconcile loop")
-			return ctrl.Result{}, nil
-		}
-		return ctrl.Result{}, nil
-	}()
 
 	valkeyCluster := &valkeyv1.ValkeyCluster{}
 	err := r.Get(ctx, req.NamespacedName, valkeyCluster)
@@ -109,6 +108,13 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{Requeue: false}, err
 	}
 
+	client, err := r.connectToCluster(ctx)
+	if err != nil {
+		return ctrl.Result{Requeue: false}, err
+	}
+
+	r.ValkeyClient = client
+
 	clusterState, err := r.getClusterState(ctx)
 
 	if err != nil {
@@ -126,11 +132,22 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	return ctrl.Result{Requeue: false}, nil
 }
 
+func (r *ValkeyClusterReconciler) ReadyZ(_ *http.Request) error {
+	if r.State.Cluster == nil {
+		return errors.New("valkey cluster not created yet")
+	}
+	if r.State.Cluster.Status.Available {
+		return nil
+	}
+	return errors.New("valkey cluster unavailable")
+}
+
 func (r *ValkeyClusterReconciler) updateClusterCustomResource(ctx context.Context, success bool) error {
 	valkeyCluster := r.State.Cluster
 
 	valkeyStatus := valkeyv1.ValkeyClusterStatus{
 		ClusterState: r.State.ClusterState,
+		Available:    success,
 	}
 
 	if success {
@@ -392,7 +409,7 @@ func (r *ValkeyClusterReconciler) createValkeyCluster(ctx context.Context) error
 	if err != nil {
 		return nil
 	}
-	_, _, err = r.valkeyCommand(
+	_, _, err = r.execValkeyPod(
 		podName,
 		"--cluster",
 		append(
@@ -407,20 +424,34 @@ func (r *ValkeyClusterReconciler) createValkeyCluster(ctx context.Context) error
 	return err
 }
 
-func (r *ValkeyClusterReconciler) getClusterState(ctx context.Context) (valkeyv1.ClusterState, error) {
-	pods, err := r.getValkeyNodePods(ctx)
-	if err != nil || len(pods.Items) < 1 {
-		return nil, errors.New("failed to get valkey pods")
-	}
-
-	podName := pods.Items[0].Name
-
-	stdout, _, err := r.valkeyCommand(podName, "cluster", []string{"nodes"}, ctx)
+func (r *ValkeyClusterReconciler) connectToCluster(ctx context.Context) (valkey.Client, error) {
+	addresses, err := r.getValkeyNodeAddresses(ctx, true)
 	if err != nil {
 		return nil, err
 	}
 
-	lines := strings.Split(strings.TrimSpace(stdout), "\n")
+	client, err := valkey.NewClient(valkey.ClientOption{
+		InitAddress: addresses,
+		SendToReplicas: func(cmd valkey.Completed) bool {
+			return cmd.IsReadOnly()
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return client, nil
+}
+
+func (r *ValkeyClusterReconciler) getClusterState(ctx context.Context) (valkeyv1.ClusterState, error) {
+	client := r.ValkeyClient
+
+	res, err := client.Do(ctx, client.B().ClusterNodes().Build()).ToString()
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(strings.TrimSpace(res), "\n")
 
 	clusterState := make(valkeyv1.ClusterState)
 
@@ -451,7 +482,7 @@ func (r *ValkeyClusterReconciler) getClusterState(ctx context.Context) (valkeyv1
 	return clusterState, nil
 }
 
-func (r *ValkeyClusterReconciler) valkeyCommand(podName, operation string, flags []string, ctx context.Context) (string, string, error) {
+func (r *ValkeyClusterReconciler) execValkeyPod(podName, operation string, flags []string, ctx context.Context) (string, string, error) {
 	binary := "valkey-cli"
 	command := []string{binary, "-p", strconv.Itoa(int(r.State.Cluster.Spec.Port)), operation}
 	command = append(command, flags...)
@@ -487,6 +518,19 @@ func (r *ValkeyClusterReconciler) valkeyCommand(podName, operation string, flags
 	}
 
 	return stdout.String(), stderr.String(), nil
+}
+
+func New(client client.Client,
+	scheme *runtime.Scheme,
+	clientSet *kubernetes.Clientset,
+	config *rest.Config) *ValkeyClusterReconciler {
+	return &ValkeyClusterReconciler{
+		Client:    client,
+		Scheme:    scheme,
+		ClientSet: clientSet,
+		Config:    config,
+		State:     ValkeyClusterState{},
+	}
 }
 
 // SetupWithManager sets up the controller with the Manager.

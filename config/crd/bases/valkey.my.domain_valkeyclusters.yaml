@@ -8090,6 +8090,8 @@ spec:
           status:
             description: ValkeyClusterStatus defines the observed state of ValkeyCluster
             properties:
+              available:
+                type: boolean
               clusterState:
                 additionalProperties:
                   properties:
@@ -8112,6 +8114,8 @@ spec:
                   - master
                   - role
                   type: object
+                description: Can't use the ClusterState type because of Operator SDK
+                  generation of CRD
                 type: object
               observedGeneration:
                 description: |-
@@ -8120,6 +8124,7 @@ spec:
                 format: int64
                 type: integer
             required:
+            - available
             - observedGeneration
             type: object
         type: object

@@ -53,8 +53,10 @@ type ClusterState = map[string]ValkeyClusterNode
 type ValkeyClusterStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	ObservedGeneration int64                        `json:"observedGeneration"`
-	ClusterState       map[string]ValkeyClusterNode `json:"clusterState,omitempty"`
+	ObservedGeneration int64 `json:"observedGeneration"`
+	Available          bool  `json:"available"`
+	// Can't use the ClusterState type because of Operator SDK generation of CRD
+	ClusterState map[string]ValkeyClusterNode `json:"clusterState,omitempty"`
 }
 
 type ValkeyNode struct {
