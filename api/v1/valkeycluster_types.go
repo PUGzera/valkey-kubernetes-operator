@@ -39,33 +39,30 @@ type ValkeyClusterSpec struct {
 }
 
 type ValkeyClusterNode struct {
-	ID      string `json:"clusterId"`
-	Address string `json:"address"`
-	IP      string `json:"ip"`
-	Role    string `json:"role"`
-	Master  string `json:"master"`
-	Slots   string `json:"slots,omitempty"`
+	ID       string `json:"clusterId"`
+	Address  string `json:"address"`
+	IP       string `json:"ip"`
+	IsMaster bool   `json:"isMaster"`
+	MasterId string `json:"masterId,omitempty"`
+	Status   string `json:"status"`
+	Slots    string `json:"slots,omitempty"`
 }
 
 type ClusterState = map[string]ValkeyClusterNode
+
+type ClusterStatus struct {
+	Available bool `json:"available"`
+	// Can't use the ClusterState type because of Operator SDK generation of CRD
+	ClusterState map[string]ValkeyClusterNode `json:"clusterState,omitempty"`
+}
 
 // ValkeyClusterStatus defines the observed state of ValkeyCluster
 type ValkeyClusterStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	ObservedGeneration int64 `json:"observedGeneration"`
-	Available          bool  `json:"available"`
-	// Can't use the ClusterState type because of Operator SDK generation of CRD
-	ClusterState map[string]ValkeyClusterNode `json:"clusterState,omitempty"`
-}
-
-type ValkeyNode struct {
-	Role      string `json:"role"`
-	Master    string `json:"master"`
-	Address   string `json:"address"`
-	PodName   string `json:"podName"`
-	ClusterId string `json:"clusterId"`
-	Slots     string `json:"slots"`
+	ObservedGeneration int64              `json:"observedGeneration"`
+	ClusterStatus      *ClusterStatus     `json:"clusterStatus,omitempty"`
+	PreviousConfig     *ValkeyClusterSpec `json:"previousConfig,omitempty"`
 }
 
 // +kubebuilder:object:root=true

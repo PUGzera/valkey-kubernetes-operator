@@ -14,6 +14,7 @@ RUN go mod download
 # Copy the go source
 COPY cmd/main.go cmd/main.go
 COPY api/ api/
+COPY internal/cluster-manager internal/cluster-manager
 COPY internal/controller/ internal/controller/
 
 # Build
