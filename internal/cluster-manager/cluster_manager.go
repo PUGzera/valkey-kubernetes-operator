@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -35,10 +36,24 @@ type valkeyClusterNode struct {
 
 type clusterState = map[string]valkeyClusterNode
 
-type clusterStatus struct {
-	Available bool
+type clusterAvailableResp struct {
+	Available   bool
+	Reason      string
+	NodeAddress string
+}
+
+type ClusterStatus struct {
+	Available clusterAvailableResp
 	State     clusterState
 }
+
+type section = string
+
+type nodeName = string
+
+type info = map[section]map[string]string
+
+type clusterInfo = map[nodeName]info
 
 type Options struct {
 	Port                int32
@@ -125,7 +140,7 @@ func (c *ValkeyClusterManager) createCluster() error {
 	return nil
 }
 
-func (c *ValkeyClusterManager) getValkeyNodeAddresses(withPort bool) ([]string, error) {
+func (c *ValkeyClusterManager) getValkeyPodAddresses(withPort bool) ([]string, error) {
 	pods, err := c.getValkeyNodePods()
 	if err != nil {
 		return nil, err
@@ -141,6 +156,10 @@ func (c *ValkeyClusterManager) getValkeyNodeAddresses(withPort bool) ([]string, 
 	}
 
 	return addresses, nil
+}
+
+func removePortFromAddress(address string) string {
+	return strings.Split(address, ":")[0]
 }
 
 func (c *ValkeyClusterManager) getFQDNFromPodName(podName string) string {
@@ -291,6 +310,7 @@ func (c *ValkeyClusterManager) valkeyPodTemplate(name string) corev1.PodTemplate
 					"--port", strconv.Itoa(int(c.port)),
 					"--cluster-announce-hostname",
 					c.getFQDNFromPodName("${HOSTNAME}"),
+					"--cluster-preferred-endpoint-type", "hostname",
 				}, " "),
 			},
 		}
@@ -344,7 +364,7 @@ func (c *ValkeyClusterManager) createValkeyCluster() error {
 
 	podName := pods.Items[0].Name
 
-	addresses, err := c.getValkeyNodeAddresses(true)
+	addresses, err := c.getValkeyPodAddresses(true)
 	if err != nil {
 		return nil
 	}
@@ -363,7 +383,7 @@ func (c *ValkeyClusterManager) createValkeyCluster() error {
 }
 
 func (c *ValkeyClusterManager) connectToCluster() error {
-	addresses, err := c.getValkeyNodeAddresses(true)
+	addresses, err := c.getValkeyPodAddresses(true)
 	if err != nil {
 		return err
 	}
@@ -383,15 +403,39 @@ func (c *ValkeyClusterManager) connectToCluster() error {
 	return nil
 }
 
-func (c *ValkeyClusterManager) GetClusterStatus() (*clusterStatus, error) {
+func (c *ValkeyClusterManager) GetClusterStatus() *ClusterStatus {
 	client := c.valkeyClient
 
 	res, err := client.Do(c.ctx, client.B().ClusterNodes().Build()).ToString()
 	if err != nil {
-		return nil, err
+		return &ClusterStatus{
+			Available: clusterAvailableResp{
+				Available:   false,
+				Reason:      err.Error(),
+				NodeAddress: "Cluster",
+			},
+		}
 	}
 
-	lines := strings.Split(strings.TrimSpace(res), "\n")
+	clusterState, err := valkeyClusterNodesResponseToClusterState(res)
+	if err != nil {
+		return &ClusterStatus{
+			Available: clusterAvailableResp{
+				Available:   false,
+				Reason:      err.Error(),
+				NodeAddress: "Cluster",
+			},
+		}
+	}
+
+	return &ClusterStatus{
+		Available: c.ClusterAvailable(),
+		State:     clusterState,
+	}
+}
+
+func valkeyClusterNodesResponseToClusterState(clusterNodesResponse string) (clusterState, error) {
+	lines := strings.Split(strings.TrimSpace(clusterNodesResponse), "\n")
 
 	clusterState := make(clusterState)
 
@@ -425,15 +469,7 @@ func (c *ValkeyClusterManager) GetClusterStatus() (*clusterStatus, error) {
 		clusterState[host] = node
 	}
 
-	available, err := c.ClusterAvailable()
-	if err != nil {
-		return nil, err
-	}
-
-	return &clusterStatus{
-		Available: available,
-		State:     clusterState,
-	}, nil
+	return clusterState, nil
 }
 
 func (c *ValkeyClusterManager) execValkeyPod(podName, operation string, flags []string) (string, string, error) {
@@ -474,33 +510,34 @@ func (c *ValkeyClusterManager) execValkeyPod(podName, operation string, flags []
 	return stdout.String(), stderr.String(), nil
 }
 
-func (c *ValkeyClusterManager) ClusterAvailable() (bool, error) {
+func (c *ValkeyClusterManager) ClusterAvailable() clusterAvailableResp {
 	clients := c.valkeyClient.Nodes()
 	for address, client := range clients {
 		res, err := client.Do(c.ctx, client.B().ClusterInfo().Build()).ToString()
 		if err != nil {
-			return false, err
+			return clusterAvailableResp{
+				Available:   false,
+				Reason:      err.Error(),
+				NodeAddress: address,
+			}
 		}
-		lines := strings.Split(strings.TrimSpace(res), "\n")
-		if len(lines) < 1 {
-			return false, fmt.Errorf("malformed output from CLUSTER INFO from %s", address)
-		}
-		prefix := "cluster_state:"
-		for _, line := range lines {
-			if strings.HasPrefix(line, prefix) && !strings.EqualFold(strings.TrimPrefix(line, prefix), "ok") {
-				return false, fmt.Errorf("cluster is not ok from %s", address)
+		clusterOk := "cluster_state:ok"
+		if !strings.Contains(res, clusterOk) {
+			return clusterAvailableResp{
+				Available:   false,
+				Reason:      res,
+				NodeAddress: address,
 			}
 		}
 	}
-	return true, nil
+	return clusterAvailableResp{
+		Available: true,
+	}
 }
 
 func (c *ValkeyClusterManager) ScaleInMaster(masters int) error {
 	if false {
-		clusterState, err := c.GetClusterStatus()
-		if err != nil {
-			return err
-		}
+		clusterState := c.GetClusterStatus()
 
 		state := clusterState.State
 		amountNodes := len(state)
@@ -510,7 +547,7 @@ func (c *ValkeyClusterManager) ScaleInMaster(masters int) error {
 			if !ok {
 				return fmt.Errorf("pod %s was not in valkey cluster", podToBeScaledIn)
 			}
-			_, err = c.valkeyClient.Do(
+			_, err := c.valkeyClient.Do(
 				c.ctx,
 				c.
 					valkeyClient.
@@ -524,12 +561,12 @@ func (c *ValkeyClusterManager) ScaleInMaster(masters int) error {
 		}
 		newReplicas := *c.statefulSet.Spec.Replicas - int32(masters)
 		c.statefulSet.Spec.Replicas = &newReplicas
-		_, err = c.clientSet.
+		_, err := c.clientSet.
 			AppsV1().
 			StatefulSets(c.namespace).
 			Update(c.ctx, c.statefulSet, v1.UpdateOptions{})
 		return err
-	}
+	} //ToDo finish scale out logic
 	return nil
 }
 
@@ -543,4 +580,68 @@ func (c *ValkeyClusterManager) ScaleInReplicas(replicas int) error {
 
 func (c *ValkeyClusterManager) ScaleOutReplicas(replicas int) error {
 	return nil
+}
+func (c *ValkeyClusterManager) Subscribe(ctx context.Context, callback func(cs *ClusterStatus) error) func() error {
+	return func() error {
+		for {
+			var lastClusterStatus ClusterStatus
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				time.Sleep(20 * time.Second)
+				clusterStatus := c.GetClusterStatus()
+				if clusterStatus == nil {
+					return errors.New("cluster status returned was nil")
+				}
+				if !reflect.DeepEqual(lastClusterStatus, *clusterStatus) {
+					err := callback(clusterStatus)
+					if err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+}
+
+func (c *ValkeyClusterManager) Info() clusterInfo {
+	clusterInfo := make(clusterInfo)
+	clients := c.valkeyClient.Nodes()
+
+	for address, client := range clients {
+		res, err := client.Do(c.ctx, client.B().Info().Build()).ToString()
+		if err == nil {
+			info, err := valkeyInfoResponseToInfo(res)
+			if err == nil {
+				clusterInfo[removePortFromAddress(address)] = info
+			}
+		}
+	}
+	return clusterInfo
+}
+
+func valkeyInfoResponseToInfo(infoResponse string) (info, error) {
+	info := make(info)
+	sections := strings.Split(infoResponse, "#")
+	for _, section := range sections {
+		sectionData := strings.Split(section, "\n")
+		if len(sectionData) < 1 {
+			return nil, errors.New("malformed info data")
+		}
+		sectionName := strings.TrimSpace(sectionData[0])
+		if len(sectionName) < 1 {
+			continue
+		}
+		metrics := sectionData[1:]
+		metricsMap := make(map[string]string)
+		for _, metric := range metrics {
+			keyValue := strings.Split(strings.TrimSpace(metric), ":")
+			if len(keyValue) == 2 {
+				metricsMap[keyValue[0]] = keyValue[1]
+			}
+		}
+		info[sectionName] = metricsMap
+	}
+	return info, nil
 }

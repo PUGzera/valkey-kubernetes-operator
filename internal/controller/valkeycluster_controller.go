@@ -46,8 +46,9 @@ type ValkeyClusterReconciler struct {
 type ValkeyClusterMap = map[string]ValkeyCluster
 
 type ValkeyCluster struct {
-	ClusterCR      *valkeyv1.ValkeyCluster
-	ClusterManager *cluster_manager.ValkeyClusterManager
+	ClusterCR              *valkeyv1.ValkeyCluster
+	ClusterManager         *cluster_manager.ValkeyClusterManager
+	ClusterSubscribeCancel context.CancelFunc
 }
 
 // +kubebuilder:rbac:groups=valkey.my.domain,resources=valkeyclusters,verbs=get;list;watch;create;update;patch;delete
@@ -75,7 +76,7 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	err := r.Get(ctx, req.NamespacedName, valkeyCluster)
 	if err != nil {
 		logger.Error(err, "failed to get ValkeyCluster")
-		return ctrl.Result{Requeue: false}, err
+		return ctrl.Result{}, nil
 	}
 
 	if valkeyCluster.Generation == valkeyCluster.Status.ObservedGeneration {
@@ -89,18 +90,19 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
-	if valkeyCluster.Generation == 1 {
-		r.onCreate(valkeyCluster)
-	} /* else {
-		r.onUpdate(valkeyCluster)
-	}*/
+	err = r.onCreate(valkeyCluster)
+	if err != nil {
+		logger.Error(err, "failed to create valkey cluster")
+		return ctrl.Result{}, nil
+	}
 
 	err = r.updateClusterCustomResource(ctx, valkeyCluster.Name)
 	if err != nil {
-		return ctrl.Result{Requeue: false}, err
+		logger.Error(err, "failed to update custom resource status")
+		return ctrl.Result{}, nil
 	}
 
-	return ctrl.Result{Requeue: false}, nil
+	return ctrl.Result{}, nil
 }
 
 func (r *ValkeyClusterReconciler) onUpdate(valkeyCluster *valkeyv1.ValkeyCluster) error {
@@ -155,10 +157,18 @@ func (r *ValkeyClusterReconciler) onCreate(valkeyCluster *valkeyv1.ValkeyCluster
 		return err
 	}
 
+	cancelCtx, cancel := context.WithCancel(context.Background())
+
 	r.State[valkeyCluster.Name] = ValkeyCluster{
-		ClusterManager: clusterManager,
-		ClusterCR:      valkeyCluster,
+		ClusterManager:         clusterManager,
+		ClusterCR:              valkeyCluster,
+		ClusterSubscribeCancel: cancel,
 	}
+
+	go clusterManager.Subscribe(cancelCtx, func(cs *cluster_manager.ClusterStatus) error {
+		valkeyCluster.Status.ClusterStatus = generateCRClusterStatus(cs)
+		return r.Status().Update(cancelCtx, valkeyCluster)
+	})()
 
 	return nil
 }
@@ -196,9 +206,9 @@ func (r *ValkeyClusterReconciler) ReadyZ(_ *http.Request) error {
 		if cluster.ClusterManager == nil {
 			return errors.New("valkey cluster manager not created yet")
 		}
-		available, err := cluster.ClusterManager.ClusterAvailable()
-		if err != nil || !available {
-			return errors.New("valkey cluster unavailable")
+		availableResp := cluster.ClusterManager.ClusterAvailable()
+		if !availableResp.Available {
+			return fmt.Errorf("node %s unavailable with reason %s", availableResp.NodeAddress, availableResp.Reason)
 		}
 	}
 	return nil
@@ -207,41 +217,49 @@ func (r *ValkeyClusterReconciler) ReadyZ(_ *http.Request) error {
 func (r *ValkeyClusterReconciler) updateClusterCustomResource(ctx context.Context, name string) error {
 	cluster := r.State[name]
 
-	clusterState, err := cluster.ClusterManager.GetClusterStatus()
-	if err != nil {
-		return nil
-	}
+	clusterStatus := cluster.ClusterManager.GetClusterStatus()
 
-	clusterStatusState := make(valkeyv1.ClusterState)
+	valkeyStatus := cluster.ClusterCR.Status
 
-	for name, node := range clusterState.State {
-		clusterStatusState[name] = valkeyv1.ValkeyClusterNode{
-			ID:       node.ID,
-			Address:  node.Address,
-			IP:       node.IP,
-			IsMaster: node.IsMaster,
-			MasterId: node.MasterId,
-			Status:   node.Status,
-			Slots:    node.Slots,
-		}
-	}
+	valkeyStatus.ClusterStatus = generateCRClusterStatus(clusterStatus)
 
-	valkeyStatus := valkeyv1.ValkeyClusterStatus{
-		ClusterStatus: &valkeyv1.ClusterStatus{
-			Available:    clusterState.Available,
-			ClusterState: clusterStatusState,
-		},
-	}
-
-	if valkeyStatus.ClusterStatus.Available {
-		valkeyStatus.ObservedGeneration = cluster.ClusterCR.Generation
-	}
+	valkeyStatus.ObservedGeneration = cluster.ClusterCR.Generation
 
 	valkeyStatus.PreviousConfig = &cluster.ClusterCR.Spec
 
 	cluster.ClusterCR.Status = valkeyStatus
 
 	return r.Status().Update(ctx, cluster.ClusterCR)
+}
+
+func generateCRClusterStatus(clusterStatus *cluster_manager.ClusterStatus) *valkeyv1.ClusterStatus {
+	availabilityInfo := &valkeyv1.ClusterAvailabilityInfo{
+		Available:   clusterStatus.Available.Available,
+		Reason:      clusterStatus.Available.Reason,
+		NodeAddress: clusterStatus.Available.NodeAddress,
+	}
+	if clusterStatus.State != nil {
+		clusterStatusState := make(valkeyv1.ClusterState)
+
+		for name, node := range clusterStatus.State {
+			clusterStatusState[name] = valkeyv1.ValkeyClusterNode{
+				ID:       node.ID,
+				Address:  node.Address,
+				IP:       node.IP,
+				IsMaster: node.IsMaster,
+				MasterId: node.MasterId,
+				Status:   node.Status,
+				Slots:    node.Slots,
+			}
+		}
+		return &valkeyv1.ClusterStatus{
+			Available:    availabilityInfo,
+			ClusterState: clusterStatusState,
+		}
+	}
+	return &valkeyv1.ClusterStatus{
+		Available: availabilityInfo,
+	}
 }
 
 func New(client client.Client,

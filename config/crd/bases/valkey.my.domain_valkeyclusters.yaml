@@ -8092,8 +8092,19 @@ spec:
             properties:
               clusterStatus:
                 properties:
-                  available:
-                    type: boolean
+                  availabilityInfo:
+                    properties:
+                      available:
+                        type: boolean
+                      node:
+                        type: string
+                      reason:
+                        type: string
+                    required:
+                    - available
+                    - node
+                    - reason
+                    type: object
                   clusterState:
                     additionalProperties:
                       properties:
@@ -8121,8 +8132,6 @@ spec:
                     description: Can't use the ClusterState type because of Operator
                       SDK generation of CRD
                     type: object
-                required:
-                - available
                 type: object
               observedGeneration:
                 description: |-

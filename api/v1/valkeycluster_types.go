@@ -50,8 +50,14 @@ type ValkeyClusterNode struct {
 
 type ClusterState = map[string]ValkeyClusterNode
 
+type ClusterAvailabilityInfo struct {
+	Available   bool   `json:"available"`
+	Reason      string `json:"reason"`
+	NodeAddress string `json:"node"`
+}
+
 type ClusterStatus struct {
-	Available bool `json:"available"`
+	Available *ClusterAvailabilityInfo `json:"availabilityInfo,omitempty"`
 	// Can't use the ClusterState type because of Operator SDK generation of CRD
 	ClusterState map[string]ValkeyClusterNode `json:"clusterState,omitempty"`
 }
