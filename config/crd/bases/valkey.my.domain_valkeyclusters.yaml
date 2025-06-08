@@ -8091,48 +8091,7 @@ spec:
             description: ValkeyClusterStatus defines the observed state of ValkeyCluster
             properties:
               clusterStatus:
-                properties:
-                  availabilityInfo:
-                    properties:
-                      available:
-                        type: boolean
-                      node:
-                        type: string
-                      reason:
-                        type: string
-                    required:
-                    - available
-                    - node
-                    - reason
-                    type: object
-                  clusterState:
-                    additionalProperties:
-                      properties:
-                        address:
-                          type: string
-                        clusterId:
-                          type: string
-                        ip:
-                          type: string
-                        isMaster:
-                          type: boolean
-                        masterId:
-                          type: string
-                        slots:
-                          type: string
-                        status:
-                          type: string
-                      required:
-                      - address
-                      - clusterId
-                      - ip
-                      - isMaster
-                      - status
-                      type: object
-                    description: Can't use the ClusterState type because of Operator
-                      SDK generation of CRD
-                    type: object
-                type: object
+                type: boolean
               observedGeneration:
                 description: |-
                   INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
@@ -16255,6 +16214,7 @@ spec:
                 - replications
                 type: object
             required:
+            - clusterStatus
             - observedGeneration
             type: object
         type: object

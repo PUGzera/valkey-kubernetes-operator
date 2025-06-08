@@ -38,36 +38,12 @@ type ValkeyClusterSpec struct {
 	ValkeyConfigMapName string                  `json:"valkeyConfigMapName,omitempty"`
 }
 
-type ValkeyClusterNode struct {
-	ID       string `json:"clusterId"`
-	Address  string `json:"address"`
-	IP       string `json:"ip"`
-	IsMaster bool   `json:"isMaster"`
-	MasterId string `json:"masterId,omitempty"`
-	Status   string `json:"status"`
-	Slots    string `json:"slots,omitempty"`
-}
-
-type ClusterState = map[string]ValkeyClusterNode
-
-type ClusterAvailabilityInfo struct {
-	Available   bool   `json:"available"`
-	Reason      string `json:"reason"`
-	NodeAddress string `json:"node"`
-}
-
-type ClusterStatus struct {
-	Available *ClusterAvailabilityInfo `json:"availabilityInfo,omitempty"`
-	// Can't use the ClusterState type because of Operator SDK generation of CRD
-	ClusterState map[string]ValkeyClusterNode `json:"clusterState,omitempty"`
-}
-
 // ValkeyClusterStatus defines the observed state of ValkeyCluster
 type ValkeyClusterStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 	ObservedGeneration int64              `json:"observedGeneration"`
-	ClusterStatus      *ClusterStatus     `json:"clusterStatus,omitempty"`
+	Available          bool               `json:"available"`
 	PreviousConfig     *ValkeyClusterSpec `json:"previousConfig,omitempty"`
 }
 

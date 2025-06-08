@@ -18,10 +18,14 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/prometheus/client_golang/prometheus"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -41,9 +45,12 @@ type ValkeyClusterReconciler struct {
 	ClientSet *kubernetes.Clientset
 	State     ValkeyClusterMap
 	Config    *rest.Config
+	Metrics   map[string]*prometheus.GaugeVec
 }
 
-type ValkeyClusterMap = map[string]ValkeyCluster
+type ValkeyNamespacedClusterMap = map[string]ValkeyCluster
+
+type ValkeyClusterMap = map[string]ValkeyNamespacedClusterMap
 
 type ValkeyCluster struct {
 	ClusterCR              *valkeyv1.ValkeyCluster
@@ -73,8 +80,7 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	logger.Info("Start reconcile...")
 
 	valkeyCluster := &valkeyv1.ValkeyCluster{}
-	err := r.Get(ctx, req.NamespacedName, valkeyCluster)
-	if err != nil {
+	if err := r.Get(ctx, req.NamespacedName, valkeyCluster); err != nil {
 		logger.Error(err, "failed to get ValkeyCluster")
 		return ctrl.Result{}, nil
 	}
@@ -90,14 +96,12 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
-	err = r.onCreate(valkeyCluster)
-	if err != nil {
+	if err := r.onCreate(valkeyCluster); err != nil {
 		logger.Error(err, "failed to create valkey cluster")
 		return ctrl.Result{}, nil
 	}
 
-	err = r.updateClusterCustomResource(ctx, valkeyCluster.Name)
-	if err != nil {
+	if err := r.updateClusterCustomResource(ctx, *valkeyCluster); err != nil {
 		logger.Error(err, "failed to update custom resource status")
 		return ctrl.Result{}, nil
 	}
@@ -111,7 +115,7 @@ func (r *ValkeyClusterReconciler) onUpdate(valkeyCluster *valkeyv1.ValkeyCluster
 		return errors.New("no previous config")
 	}
 
-	state, ok := r.State[valkeyCluster.Name]
+	state, ok := r.State[valkeyCluster.Namespace][valkeyCluster.Name]
 	if !ok {
 		prevValkeyCluster := &valkeyv1.ValkeyCluster{
 			TypeMeta:   valkeyCluster.TypeMeta,
@@ -124,12 +128,12 @@ func (r *ValkeyClusterReconciler) onUpdate(valkeyCluster *valkeyv1.ValkeyCluster
 			return err
 		}
 
-		r.State[valkeyCluster.Name] = ValkeyCluster{
+		r.State[valkeyCluster.Namespace][valkeyCluster.Name] = ValkeyCluster{
 			ClusterManager: clusterManager,
 			ClusterCR:      prevValkeyCluster,
 		}
 
-		state = r.State[valkeyCluster.Name]
+		state = r.State[valkeyCluster.Namespace][valkeyCluster.Name]
 	}
 
 	currentConf := valkeyCluster.Spec
@@ -159,18 +163,57 @@ func (r *ValkeyClusterReconciler) onCreate(valkeyCluster *valkeyv1.ValkeyCluster
 
 	cancelCtx, cancel := context.WithCancel(context.Background())
 
-	r.State[valkeyCluster.Name] = ValkeyCluster{
+	r.State[valkeyCluster.Namespace] = make(ValkeyNamespacedClusterMap)
+	r.State[valkeyCluster.Namespace][valkeyCluster.Name] = ValkeyCluster{
 		ClusterManager:         clusterManager,
 		ClusterCR:              valkeyCluster,
 		ClusterSubscribeCancel: cancel,
 	}
 
-	go clusterManager.Subscribe(cancelCtx, func(cs *cluster_manager.ClusterStatus) error {
-		valkeyCluster.Status.ClusterStatus = generateCRClusterStatus(cs)
-		return r.Status().Update(cancelCtx, valkeyCluster)
+	go clusterManager.OnClusterStatusChangeFunc(cancelCtx, func(cs cluster_manager.ClusterStatus, ps *cluster_manager.ClusterStatus) error {
+		if ps == nil {
+			if !cs.Available.Available {
+				r.Metrics["unhealthy_cluster_amount_total"].WithLabelValues().Inc()
+				r.Metrics["unhealthy_cluster_amount_namespace"].WithLabelValues(valkeyCluster.Namespace).Inc()
+			}
+			valkeyCluster.Status.Available = cs.Available.Available
+			return r.Status().Update(cancelCtx, valkeyCluster)
+		}
+		if !reflect.DeepEqual(cs.Available, ps.Available) {
+			if cs.Available.Available && cs.Available.Available != ps.Available.Available {
+				r.Metrics["unhealthy_cluster_amount_total"].WithLabelValues().Dec()
+				r.Metrics["unhealthy_cluster_amount_namespace"].WithLabelValues(valkeyCluster.Namespace).Dec()
+			} else if cs.Available.Available != ps.Available.Available {
+				r.Metrics["unhealthy_cluster_amount_total"].WithLabelValues().Inc()
+				r.Metrics["unhealthy_cluster_amount_namespace"].WithLabelValues(valkeyCluster.Namespace).Inc()
+			}
+			valkeyCluster.Status.Available = cs.Available.Available
+			return r.Status().Update(cancelCtx, valkeyCluster)
+		}
+		return nil
 	})()
 
+	r.onCreateMetricsUpdate(valkeyCluster)
+
 	return nil
+}
+
+func (r *ValkeyClusterReconciler) onCreateMetricsUpdate(valkeyCluster *valkeyv1.ValkeyCluster) {
+	r.Metrics["cluster_amount_total"].WithLabelValues().Inc()
+	r.Metrics["cluster_amount_namespace"].WithLabelValues(valkeyCluster.Namespace).Inc()
+
+	r.Metrics["master_amount_total"].WithLabelValues().Add(float64(valkeyCluster.Spec.Masters))
+	r.Metrics["master_amount_namespace"].WithLabelValues(valkeyCluster.Namespace).Add(float64(valkeyCluster.Spec.Masters))
+	r.Metrics["master_amount_cluster"].WithLabelValues(valkeyCluster.Namespace, valkeyCluster.Name).Add(float64(valkeyCluster.Spec.Masters))
+
+	amountReplicas := valkeyCluster.Spec.Masters * valkeyCluster.Spec.Replications
+	r.Metrics["replica_amount_total"].WithLabelValues().Add(float64(amountReplicas))
+	r.Metrics["replica_amount_namespace"].WithLabelValues(valkeyCluster.Namespace).Add(float64(amountReplicas))
+	r.Metrics["replica_amount_cluster"].WithLabelValues(valkeyCluster.Namespace, valkeyCluster.Name).Add(float64(amountReplicas))
+
+	amountNodes := valkeyCluster.Spec.Masters + valkeyCluster.Spec.Masters*valkeyCluster.Spec.Replications
+	r.Metrics["node_amount_total"].WithLabelValues().Add(float64(amountNodes))
+	r.Metrics["node_amount_namespace"].WithLabelValues(valkeyCluster.Namespace).Add(float64(amountNodes))
 }
 
 func (r *ValkeyClusterReconciler) GenerateOptions(valkeyCluster *valkeyv1.ValkeyCluster) cluster_manager.Options {
@@ -198,30 +241,170 @@ func (r *ValkeyClusterReconciler) GenerateOptions(valkeyCluster *valkeyv1.Valkey
 	return options
 }
 
-func (r *ValkeyClusterReconciler) ReadyZ(_ *http.Request) error {
-	for _, cluster := range r.State {
-		if cluster.ClusterCR == nil {
-			return errors.New("valkey cluster not created yet")
-		}
-		if cluster.ClusterManager == nil {
-			return errors.New("valkey cluster manager not created yet")
-		}
-		availableResp := cluster.ClusterManager.ClusterAvailable()
-		if !availableResp.Available {
-			return fmt.Errorf("node %s unavailable with reason %s", availableResp.NodeAddress, availableResp.Reason)
-		}
-	}
-	return nil
+func (r *ValkeyClusterReconciler) ValkeyInfoHttpHandler() *chi.Mux {
+	rootRouter := chi.NewRouter()
+	r.setupInfoRoutes(rootRouter)
+	r.setupClusterInfoRoutes(rootRouter)
+	r.setupClusterStatusRoutes(rootRouter)
+	return rootRouter
 }
 
-func (r *ValkeyClusterReconciler) updateClusterCustomResource(ctx context.Context, name string) error {
-	cluster := r.State[name]
+func (r *ValkeyClusterReconciler) setupInfoRoutes(rootRouter *chi.Mux) {
+	rootRouter.Route("/info", func(router chi.Router) {
+		router.Get("/{namespace}/{name}", func(w http.ResponseWriter, req *http.Request) {
+			namespace := req.PathValue("namespace")
+			name := req.PathValue("name")
+			state, ok := r.State[namespace][name]
+			if ok {
+				if state.ClusterManager == nil {
+					http.Error(w, fmt.Sprintf("Valkey cluster %s not yet setup", name), http.StatusNotFound)
+				} else {
+					writeJSON(w, state.ClusterManager.Info())
+				}
+			} else {
+				http.Error(w, fmt.Sprintf("No valkey cluster with name %s", name), http.StatusNotFound)
+			}
+		})
+
+		router.Get("/{namespace}/{name}/{node}", func(w http.ResponseWriter, req *http.Request) {
+			namespace := req.PathValue("namespace")
+			name := req.PathValue("name")
+			state, ok := r.State[namespace][name]
+			if ok {
+				if state.ClusterManager == nil {
+					http.Error(w, fmt.Sprintf("Valkey cluster %s not yet setup", name), http.StatusNotFound)
+				} else {
+					node := req.PathValue("node")
+					writeJSON(w, state.ClusterManager.Info()[node])
+				}
+			} else {
+				http.Error(w, fmt.Sprintf("No valkey cluster with name %s", name), http.StatusNotFound)
+			}
+		})
+
+		router.Get("/{namespace}/{name}/{node}/{section}", func(w http.ResponseWriter, req *http.Request) {
+			namespace := req.PathValue("namespace")
+			name := req.PathValue("name")
+			state, ok := r.State[namespace][name]
+			if ok {
+				if state.ClusterManager == nil {
+					http.Error(w, fmt.Sprintf("Valkey cluster %s not yet setup", name), http.StatusNotFound)
+				} else {
+					node := req.PathValue("node")
+					section := req.PathValue("section")
+					writeJSON(w, state.ClusterManager.Info()[node][section])
+				}
+			} else {
+				http.Error(w, fmt.Sprintf("No valkey cluster with name %s", name), http.StatusNotFound)
+			}
+		})
+
+		router.Get("/{namespace}/{name}/{node}/{section}/{key}", func(w http.ResponseWriter, req *http.Request) {
+			namespace := req.PathValue("namespace")
+			name := req.PathValue("name")
+			state, ok := r.State[namespace][name]
+			if ok {
+				if state.ClusterManager == nil {
+					http.Error(w, fmt.Sprintf("Valkey cluster %s not yet setup", name), http.StatusNotFound)
+				} else {
+					node := req.PathValue("node")
+					section := req.PathValue("section")
+					key := req.PathValue("key")
+					writeJSON(w, state.ClusterManager.Info()[node][section][key])
+				}
+			} else {
+				http.Error(w, fmt.Sprintf("No valkey cluster with name %s", name), http.StatusNotFound)
+			}
+		})
+	})
+}
+
+func (r *ValkeyClusterReconciler) setupClusterInfoRoutes(rootRouter *chi.Mux) {
+	rootRouter.Route("/cluster-info", func(router chi.Router) {
+		router.Get("/{namespace}/{name}", func(w http.ResponseWriter, req *http.Request) {
+			namespace := req.PathValue("namespace")
+			name := req.PathValue("name")
+			state, ok := r.State[namespace][name]
+			if ok {
+				if state.ClusterManager == nil {
+					http.Error(w, fmt.Sprintf("Valkey cluster %s not yet setup", name), http.StatusNotFound)
+				} else {
+					writeJSON(w, state.ClusterManager.ClusterInfo())
+				}
+			} else {
+				http.Error(w, fmt.Sprintf("No valkey cluster with name %s", name), http.StatusNotFound)
+			}
+		})
+
+		router.Get("/{namespace}/{name}/{node}", func(w http.ResponseWriter, req *http.Request) {
+			namespace := req.PathValue("namespace")
+			name := req.PathValue("name")
+			state, ok := r.State[namespace][name]
+			if ok {
+				if state.ClusterManager == nil {
+					http.Error(w, fmt.Sprintf("Valkey cluster %s not yet setup", name), http.StatusNotFound)
+				} else {
+					node := req.PathValue("node")
+					writeJSON(w, state.ClusterManager.ClusterInfo()[node])
+				}
+			} else {
+				http.Error(w, fmt.Sprintf("No valkey cluster with name %s", name), http.StatusNotFound)
+			}
+		})
+
+		router.Get("/{namespace}/{name}/{node}/{key}", func(w http.ResponseWriter, req *http.Request) {
+			namespace := req.PathValue("namespace")
+			name := req.PathValue("name")
+			state, ok := r.State[namespace][name]
+			if ok {
+				if state.ClusterManager == nil {
+					http.Error(w, fmt.Sprintf("Valkey cluster %s not yet setup", name), http.StatusNotFound)
+				} else {
+					node := req.PathValue("node")
+					key := req.PathValue("key")
+					writeJSON(w, state.ClusterManager.ClusterInfo()[node][key])
+				}
+			} else {
+				http.Error(w, fmt.Sprintf("No valkey cluster with name %s", name), http.StatusNotFound)
+			}
+		})
+	})
+}
+
+func (r *ValkeyClusterReconciler) setupClusterStatusRoutes(rootRouter *chi.Mux) {
+	rootRouter.Route("/cluster-status", func(router chi.Router) {
+		router.Get("/{namespace}/{name}", func(w http.ResponseWriter, req *http.Request) {
+			namespace := req.PathValue("namespace")
+			name := req.PathValue("name")
+			state, ok := r.State[namespace][name]
+			if ok {
+				if state.ClusterManager == nil {
+					http.Error(w, fmt.Sprintf("Valkey cluster %s not yet setup", name), http.StatusNotFound)
+				} else {
+					writeJSON(w, state.ClusterManager.GetClusterStatus())
+				}
+			} else {
+				http.Error(w, fmt.Sprintf("No valkey cluster with name %s", name), http.StatusNotFound)
+			}
+		})
+	})
+}
+
+func writeJSON(w http.ResponseWriter, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		http.Error(w, "failed to encode JSON", http.StatusInternalServerError)
+	}
+}
+
+func (r *ValkeyClusterReconciler) updateClusterCustomResource(ctx context.Context, valkeyCluster valkeyv1.ValkeyCluster) error {
+	cluster := r.State[valkeyCluster.Namespace][valkeyCluster.Name]
 
 	clusterStatus := cluster.ClusterManager.GetClusterStatus()
 
 	valkeyStatus := cluster.ClusterCR.Status
 
-	valkeyStatus.ClusterStatus = generateCRClusterStatus(clusterStatus)
+	valkeyStatus.Available = clusterStatus.Available.Available
 
 	valkeyStatus.ObservedGeneration = cluster.ClusterCR.Generation
 
@@ -232,45 +415,17 @@ func (r *ValkeyClusterReconciler) updateClusterCustomResource(ctx context.Contex
 	return r.Status().Update(ctx, cluster.ClusterCR)
 }
 
-func generateCRClusterStatus(clusterStatus *cluster_manager.ClusterStatus) *valkeyv1.ClusterStatus {
-	availabilityInfo := &valkeyv1.ClusterAvailabilityInfo{
-		Available:   clusterStatus.Available.Available,
-		Reason:      clusterStatus.Available.Reason,
-		NodeAddress: clusterStatus.Available.NodeAddress,
-	}
-	if clusterStatus.State != nil {
-		clusterStatusState := make(valkeyv1.ClusterState)
-
-		for name, node := range clusterStatus.State {
-			clusterStatusState[name] = valkeyv1.ValkeyClusterNode{
-				ID:       node.ID,
-				Address:  node.Address,
-				IP:       node.IP,
-				IsMaster: node.IsMaster,
-				MasterId: node.MasterId,
-				Status:   node.Status,
-				Slots:    node.Slots,
-			}
-		}
-		return &valkeyv1.ClusterStatus{
-			Available:    availabilityInfo,
-			ClusterState: clusterStatusState,
-		}
-	}
-	return &valkeyv1.ClusterStatus{
-		Available: availabilityInfo,
-	}
-}
-
 func New(client client.Client,
 	scheme *runtime.Scheme,
 	clientSet *kubernetes.Clientset,
-	config *rest.Config) *ValkeyClusterReconciler {
+	config *rest.Config,
+	metrics map[string]*prometheus.GaugeVec) *ValkeyClusterReconciler {
 	return &ValkeyClusterReconciler{
 		Client:    client,
 		Scheme:    scheme,
 		ClientSet: clientSet,
 		Config:    config,
+		Metrics:   metrics,
 		State:     make(ValkeyClusterMap),
 	}
 }

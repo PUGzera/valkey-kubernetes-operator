@@ -18,11 +18,14 @@ package main
 
 import (
 	"crypto/tls"
+	"errors"
 	"flag"
+	"fmt"
 	"os"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
+	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
@@ -32,6 +35,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	m "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -51,6 +55,70 @@ func init() {
 
 	utilruntime.Must(valkeyv1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
+}
+
+func registerMetrics() (map[string]*prometheus.GaugeVec, error) {
+	metrics, err := generateClusterNamespaceMetrics(
+		"cluster",
+		"node",
+		"master",
+		"replica",
+		"unhealthy_cluster",
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	masterCluster := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "master_amount_cluster",
+		Help: "Total amount of Valkey masters created in a given cluster",
+	}, []string{"namespace", "name"})
+	if masterCluster == nil {
+		return nil, errors.New("failed to create metric master_amount_cluster")
+	}
+	metrics["master_amount_cluster"] = masterCluster
+
+	replicaCluster := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "replica_amount_cluster",
+		Help: "Total amount of Valkey replicas created in a given cluster",
+	}, []string{"namespace", "name"})
+	if replicaCluster == nil {
+		return nil, errors.New("failed to create metric replica_amount_cluster")
+	}
+	metrics["replica_amount_cluster"] = replicaCluster
+
+	for _, metric := range metrics {
+		m.Registry.MustRegister(metric)
+	}
+
+	return metrics, nil
+}
+
+func generateClusterNamespaceMetrics(metricUnits ...string) (map[string]*prometheus.GaugeVec, error) {
+	metrics := make(map[string]*prometheus.GaugeVec)
+	for _, metric := range metricUnits {
+		totalName := fmt.Sprintf("%s_amount_total", metric)
+		total := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: totalName,
+			Help: fmt.Sprintf("Total amount of Valkey %ss created", metric),
+		}, []string{})
+		if total == nil {
+			return nil, fmt.Errorf("failed to create metric %s", metric)
+		}
+		metrics[totalName] = total
+
+		namespacedName := fmt.Sprintf("%s_amount_namespace", metric)
+		namespaced := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: namespacedName,
+			Help: fmt.Sprintf("Total amount of Valkey %ss created in a given namespace", metric),
+		}, []string{"namespace"})
+		if namespaced == nil {
+			return nil, fmt.Errorf("failed to create namespaced metric %s", metric)
+		}
+		metrics[namespacedName] = namespaced
+	}
+
+	return metrics, nil
 }
 
 func main() {
@@ -145,12 +213,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	metrics, err := registerMetrics()
+	if err != nil {
+		setupLog.Error(err, "unable to register metrics")
+		os.Exit(1)
+	}
+
 	clientSet, err := kubernetes.NewForConfig(mgr.GetConfig())
 	if err != nil {
 		setupLog.Error(err, "unable to get Kubernetes clientset")
 		os.Exit(1)
 	}
-	valkeyClusterReconciler := controller.New(mgr.GetClient(), mgr.GetScheme(), clientSet, mgr.GetConfig())
+	valkeyClusterReconciler := controller.New(mgr.GetClient(), mgr.GetScheme(), clientSet, mgr.GetConfig(), metrics)
 	if err = valkeyClusterReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ValkeyCluster")
 		os.Exit(1)
@@ -161,8 +235,13 @@ func main() {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("readyz", valkeyClusterReconciler.ReadyZ); err != nil {
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
+		os.Exit(1)
+	}
+
+	if err := mgr.AddMetricsServerExtraHandler("/", valkeyClusterReconciler.ValkeyInfoHttpHandler()); err != nil {
+		setupLog.Error(err, "unable to set up valkey info http handler")
 		os.Exit(1)
 	}
 

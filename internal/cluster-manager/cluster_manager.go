@@ -37,14 +37,14 @@ type valkeyClusterNode struct {
 type clusterState = map[string]valkeyClusterNode
 
 type clusterAvailableResp struct {
-	Available   bool
-	Reason      string
-	NodeAddress string
+	Available   bool   `json:"available"`
+	Reason      string `json:"reason,omitempty"`
+	NodeAddress string `json:"node,omitempty"`
 }
 
 type ClusterStatus struct {
-	Available clusterAvailableResp
-	State     clusterState
+	Available clusterAvailableResp `json:"availability"`
+	State     clusterState         `json:"clusterState,omitempty"`
 }
 
 type section = string
@@ -53,7 +53,9 @@ type nodeName = string
 
 type info = map[section]map[string]string
 
-type clusterInfo = map[nodeName]info
+type clusterNodeInfo = map[nodeName]info
+
+type clusterInfo = map[nodeName]map[string]string
 
 type Options struct {
 	Port                int32
@@ -89,7 +91,7 @@ type ValkeyClusterManager struct {
 
 func New(options Options) (*ValkeyClusterManager, error) {
 	if options.Config == nil {
-		return nil, errors.New("invalid config")
+		return nil, errors.New("invalid config, config is a nil pointer")
 	}
 
 	clientSet, err := kubernetes.NewForConfig(options.Config)
@@ -111,13 +113,11 @@ func New(options Options) (*ValkeyClusterManager, error) {
 	ValkeyClusterManager.config = options.Config
 	ValkeyClusterManager.ctx = context.Background()
 
-	err = ValkeyClusterManager.createCluster()
-	if err != nil {
+	if err := ValkeyClusterManager.createCluster(); err != nil {
 		return nil, err
 	}
 
-	err = ValkeyClusterManager.connectToCluster()
-	if err != nil {
+	if err := ValkeyClusterManager.connectToCluster(); err != nil {
 		return nil, err
 	}
 
@@ -125,13 +125,11 @@ func New(options Options) (*ValkeyClusterManager, error) {
 }
 
 func (c *ValkeyClusterManager) createCluster() error {
-	err := c.createValkeyClusterKubernetesResources()
-	if err != nil {
+	if err := c.createValkeyClusterKubernetesResources(); err != nil {
 		return err
 	}
 
-	err = c.createValkeyCluster()
-	if err != nil {
+	if err := c.createValkeyCluster(); err != nil {
 		return err
 	}
 
@@ -190,8 +188,7 @@ func (c *ValkeyClusterManager) createValkeyClusterKubernetesResources() error {
 		return err
 	}
 
-	err = c.waitForStatefulSetToBeReady(statefulSet, time.Minute*5)
-	if err != nil {
+	if err := c.waitForStatefulSetToBeReady(statefulSet, time.Minute*5); err != nil {
 		return err
 	}
 
@@ -403,12 +400,12 @@ func (c *ValkeyClusterManager) connectToCluster() error {
 	return nil
 }
 
-func (c *ValkeyClusterManager) GetClusterStatus() *ClusterStatus {
+func (c *ValkeyClusterManager) GetClusterStatus() ClusterStatus {
 	client := c.valkeyClient
 
 	res, err := client.Do(c.ctx, client.B().ClusterNodes().Build()).ToString()
 	if err != nil {
-		return &ClusterStatus{
+		return ClusterStatus{
 			Available: clusterAvailableResp{
 				Available:   false,
 				Reason:      err.Error(),
@@ -419,7 +416,7 @@ func (c *ValkeyClusterManager) GetClusterStatus() *ClusterStatus {
 
 	clusterState, err := valkeyClusterNodesResponseToClusterState(res)
 	if err != nil {
-		return &ClusterStatus{
+		return ClusterStatus{
 			Available: clusterAvailableResp{
 				Available:   false,
 				Reason:      err.Error(),
@@ -428,7 +425,7 @@ func (c *ValkeyClusterManager) GetClusterStatus() *ClusterStatus {
 		}
 	}
 
-	return &ClusterStatus{
+	return ClusterStatus{
 		Available: c.ClusterAvailable(),
 		State:     clusterState,
 	}
@@ -442,7 +439,7 @@ func valkeyClusterNodesResponseToClusterState(clusterNodesResponse string) (clus
 	for _, line := range lines {
 		parts := strings.Fields(line)
 		if len(parts) < 8 || len(parts) > 9 {
-			return nil, errors.New("malformed cluster state data received")
+			return nil, fmt.Errorf("malformed cluster state data received: %+v", parts)
 		}
 
 		node := valkeyClusterNode{
@@ -499,11 +496,10 @@ func (c *ValkeyClusterManager) execValkeyPod(podName, operation string, flags []
 	}
 
 	var stdout, stderr bytes.Buffer
-	err = exec.StreamWithContext(c.ctx, remotecommand.StreamOptions{
+	if err := exec.StreamWithContext(c.ctx, remotecommand.StreamOptions{
 		Stdout: bufio.NewWriter(&stdout),
 		Stderr: bufio.NewWriter(&stderr),
-	})
-	if err != nil {
+	}); err != nil {
 		return "", "", errors.New(stderr.String())
 	}
 
@@ -533,6 +529,32 @@ func (c *ValkeyClusterManager) ClusterAvailable() clusterAvailableResp {
 	return clusterAvailableResp{
 		Available: true,
 	}
+}
+
+func (c *ValkeyClusterManager) ClusterInfo() clusterInfo {
+	clusterInfo := make(clusterInfo)
+	clients := c.valkeyClient.Nodes()
+	for address, client := range clients {
+		res, err := client.Do(c.ctx, client.B().ClusterInfo().Build()).ToString()
+		if err != nil {
+			continue
+		}
+		clusterInfo[removePortFromAddress(address)] = parseValkeyClusterInfo(res)
+	}
+
+	return clusterInfo
+}
+
+func parseValkeyClusterInfo(valkeyClusterInfo string) map[string]string {
+	clusterInfoMap := make(map[string]string)
+	lines := strings.Split(valkeyClusterInfo, "\n")
+	for _, line := range lines {
+		keyValue := strings.Split(strings.TrimSpace(line), ":")
+		if len(keyValue) == 2 {
+			clusterInfoMap[keyValue[0]] = keyValue[1]
+		}
+	}
+	return clusterInfoMap
 }
 
 func (c *ValkeyClusterManager) ScaleInMaster(masters int) error {
@@ -581,55 +603,54 @@ func (c *ValkeyClusterManager) ScaleInReplicas(replicas int) error {
 func (c *ValkeyClusterManager) ScaleOutReplicas(replicas int) error {
 	return nil
 }
-func (c *ValkeyClusterManager) Subscribe(ctx context.Context, callback func(cs *ClusterStatus) error) func() error {
+func (c *ValkeyClusterManager) OnClusterStatusChangeFunc(ctx context.Context, callback func(cs ClusterStatus, ps *ClusterStatus) error) func() error {
 	return func() error {
+		var lastClusterStatus *ClusterStatus
 		for {
-			var lastClusterStatus ClusterStatus
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
 				time.Sleep(20 * time.Second)
 				clusterStatus := c.GetClusterStatus()
-				if clusterStatus == nil {
-					return errors.New("cluster status returned was nil")
-				}
-				if !reflect.DeepEqual(lastClusterStatus, *clusterStatus) {
-					err := callback(clusterStatus)
-					if err != nil {
+				if lastClusterStatus == nil || !reflect.DeepEqual(*lastClusterStatus, clusterStatus) {
+					if err := callback(clusterStatus, lastClusterStatus); err != nil {
 						return err
 					}
 				}
+				lastClusterStatus = &clusterStatus
 			}
 		}
 	}
 }
 
-func (c *ValkeyClusterManager) Info() clusterInfo {
-	clusterInfo := make(clusterInfo)
+func (c *ValkeyClusterManager) Info() clusterNodeInfo {
+	clusterInfo := make(clusterNodeInfo)
 	clients := c.valkeyClient.Nodes()
 
 	for address, client := range clients {
 		res, err := client.Do(c.ctx, client.B().Info().Build()).ToString()
-		if err == nil {
-			info, err := valkeyInfoResponseToInfo(res)
-			if err == nil {
-				clusterInfo[removePortFromAddress(address)] = info
-			}
+		if err != nil {
+			continue
 		}
+		info, err := parseValkeyInfo(res)
+		if err != nil {
+			continue
+		}
+		clusterInfo[removePortFromAddress(address)] = info
 	}
 	return clusterInfo
 }
 
-func valkeyInfoResponseToInfo(infoResponse string) (info, error) {
+func parseValkeyInfo(valkeyInfo string) (info, error) {
 	info := make(info)
-	sections := strings.Split(infoResponse, "#")
+	sections := strings.Split(valkeyInfo, "#")
 	for _, section := range sections {
 		sectionData := strings.Split(section, "\n")
 		if len(sectionData) < 1 {
 			return nil, errors.New("malformed info data")
 		}
-		sectionName := strings.TrimSpace(sectionData[0])
+		sectionName := strings.ToLower(strings.TrimSpace(sectionData[0]))
 		if len(sectionName) < 1 {
 			continue
 		}
