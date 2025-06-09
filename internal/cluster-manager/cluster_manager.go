@@ -102,30 +102,33 @@ func New(options Options) (*ValkeyClusterManager, error) {
 		return nil, err
 	}
 
-	ValkeyClusterManager := &ValkeyClusterManager{}
-	ValkeyClusterManager.clientSet = clientSet
-	ValkeyClusterManager.port = options.Port
-	ValkeyClusterManager.name = options.Name
-	ValkeyClusterManager.namespace = options.Namespace
-	ValkeyClusterManager.masters = options.Masters
-	ValkeyClusterManager.replications = options.Replications
-	ValkeyClusterManager.owner = options.Owner
-	ValkeyClusterManager.podTemplate = options.PodTemplate
-	ValkeyClusterManager.valkeyVersion = options.ValkeyVersion
-	ValkeyClusterManager.valkeyConfigMapName = options.ValkeyConfigMapName
-	ValkeyClusterManager.valkeyPVCName = options.ValkeyPVCName
-	ValkeyClusterManager.config = options.Config
-	ValkeyClusterManager.ctx = context.Background()
+	valkeyClusterManager := &ValkeyClusterManager{}
+	valkeyClusterManager.clientSet = clientSet
+	valkeyClusterManager.port = options.Port
+	if options.Port == 0 {
+		valkeyClusterManager.port = 6379
+	}
+	valkeyClusterManager.name = options.Name
+	valkeyClusterManager.namespace = options.Namespace
+	valkeyClusterManager.masters = options.Masters
+	valkeyClusterManager.replications = options.Replications
+	valkeyClusterManager.owner = options.Owner
+	valkeyClusterManager.podTemplate = options.PodTemplate
+	valkeyClusterManager.valkeyVersion = options.ValkeyVersion
+	valkeyClusterManager.valkeyConfigMapName = options.ValkeyConfigMapName
+	valkeyClusterManager.valkeyPVCName = options.ValkeyPVCName
+	valkeyClusterManager.config = options.Config
+	valkeyClusterManager.ctx = context.Background()
 
-	if err := ValkeyClusterManager.createCluster(); err != nil {
+	if err := valkeyClusterManager.createCluster(); err != nil {
 		return nil, err
 	}
 
-	if err := ValkeyClusterManager.connectToCluster(); err != nil {
+	if err := valkeyClusterManager.connectToCluster(); err != nil {
 		return nil, err
 	}
 
-	return ValkeyClusterManager, nil
+	return valkeyClusterManager, nil
 }
 
 func (c *ValkeyClusterManager) createCluster() error {
@@ -255,6 +258,9 @@ func (c *ValkeyClusterManager) valkeyStatefulSetTemplate() appsv1.StatefulSet {
 			corev1.PersistentVolumeClaim{
 				ObjectMeta: v1.ObjectMeta{
 					Name: name,
+					OwnerReferences: []v1.OwnerReference{
+						c.owner,
+					},
 				},
 				Spec: corev1.PersistentVolumeClaimSpec{
 					AccessModes: []corev1.PersistentVolumeAccessMode{

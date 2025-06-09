@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	valkeyv1 "valkey-operator/api/v1"
@@ -58,6 +59,10 @@ type ValkeyCluster struct {
 	ClusterSubscribeCancel context.CancelFunc
 }
 
+const (
+	finalizer = "valkey.my.domain/finalizer"
+)
+
 // +kubebuilder:rbac:groups=valkey.my.domain,resources=valkeyclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=valkey.my.domain,resources=valkeyclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=valkey.my.domain,resources=valkeyclusters/finalizers,verbs=update
@@ -81,14 +86,33 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	valkeyCluster := &valkeyv1.ValkeyCluster{}
 	if err := r.Get(ctx, req.NamespacedName, valkeyCluster); err != nil {
-		logger.Error(err, "failed to get ValkeyCluster")
+		logger.Error(err, fmt.Sprintf("failed to get ValkeyCluster %s/%s", req.Namespace, req.Name))
+		return ctrl.Result{}, nil
+	}
+
+	if !valkeyCluster.ObjectMeta.DeletionTimestamp.IsZero() {
+		if r.State[valkeyCluster.Namespace] != nil {
+			if cluster, ok := r.State[valkeyCluster.Namespace][valkeyCluster.Name]; ok {
+				cluster.ClusterSubscribeCancel()
+			}
+		}
+		controllerutil.RemoveFinalizer(valkeyCluster, finalizer)
+		if err := r.Update(ctx, valkeyCluster); err != nil {
+			logger.Error(err, fmt.Sprintf(
+				"failed to remove finalizer for %s/%s",
+				valkeyCluster.Namespace,
+				valkeyCluster.Name,
+			))
+		}
 		return ctrl.Result{}, nil
 	}
 
 	if valkeyCluster.Generation == valkeyCluster.Status.ObservedGeneration {
 		logger.Info(
 			fmt.Sprintf(
-				"No update to CO, ObservedGeneration: %d, Generation: %d",
+				"No update to CO %s/%s, ObservedGeneration: %d, Generation: %d",
+				valkeyCluster.Namespace,
+				valkeyCluster.Namespace,
 				valkeyCluster.Status.ObservedGeneration,
 				valkeyCluster.Generation,
 			),
@@ -97,12 +121,34 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	if err := r.onCreate(valkeyCluster); err != nil {
-		logger.Error(err, "failed to create valkey cluster")
+		logger.Error(err, fmt.Sprintf(
+			"failed to create valkey cluster %s/%s",
+			valkeyCluster.Namespace,
+			valkeyCluster.Name,
+		))
 		return ctrl.Result{}, nil
 	}
 
 	if err := r.updateClusterCustomResource(ctx, *valkeyCluster); err != nil {
 		logger.Error(err, "failed to update custom resource status")
+		return ctrl.Result{}, nil
+	}
+
+	if success := controllerutil.AddFinalizer(valkeyCluster, finalizer); !success {
+		logger.Error(errors.New("failed to add finalizer"), fmt.Sprintf(
+			"failed to add finalizer for %s/%s",
+			valkeyCluster.Namespace,
+			valkeyCluster.Name,
+		))
+		return ctrl.Result{}, nil
+	}
+
+	if err := r.Update(ctx, valkeyCluster); err != nil {
+		logger.Error(errors.New("failed to add finalizer"), fmt.Sprintf(
+			"failed to update CR finalizer for %s/%s",
+			valkeyCluster.Namespace,
+			valkeyCluster.Name,
+		))
 		return ctrl.Result{}, nil
 	}
 
