@@ -8081,6 +8081,8 @@ spec:
                 type: integer
               valkeyConfigMapName:
                 type: string
+              valkeyPVCName:
+                type: string
               valkeyVersion:
                 type: string
             required:
@@ -8090,7 +8092,7 @@ spec:
           status:
             description: ValkeyClusterStatus defines the observed state of ValkeyCluster
             properties:
-              clusterStatus:
+              available:
                 type: boolean
               observedGeneration:
                 description: |-
@@ -16207,6 +16209,8 @@ spec:
                     type: integer
                   valkeyConfigMapName:
                     type: string
+                  valkeyPVCName:
+                    type: string
                   valkeyVersion:
                     type: string
                 required:
@@ -16214,7 +16218,7 @@ spec:
                 - replications
                 type: object
             required:
-            - clusterStatus
+            - available
             - observedGeneration
             type: object
         type: object

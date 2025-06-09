@@ -36,6 +36,7 @@ type ValkeyClusterSpec struct {
 	ValkeyVersion       string                  `json:"valkeyVersion,omitempty"`
 	PodTemplate         *corev1.PodTemplateSpec `json:"podTemplate,omitempty"`
 	ValkeyConfigMapName string                  `json:"valkeyConfigMapName,omitempty"`
+	ValkeyPVCName       string                  `json:"valkeyPVCName,omitempty"`
 }
 
 // ValkeyClusterStatus defines the observed state of ValkeyCluster

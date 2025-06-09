@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/valkey-io/valkey-go"
+	"k8s.io/apimachinery/pkg/api/resource"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -67,6 +68,7 @@ type Options struct {
 	PodTemplate         corev1.PodTemplateSpec
 	ValkeyVersion       string
 	ValkeyConfigMapName string
+	ValkeyPVCName       string
 	Config              *rest.Config
 }
 
@@ -80,6 +82,7 @@ type ValkeyClusterManager struct {
 	podTemplate         corev1.PodTemplateSpec
 	valkeyVersion       string
 	valkeyConfigMapName string
+	valkeyPVCName       string
 	config              *rest.Config
 
 	clientSet    *kubernetes.Clientset
@@ -110,6 +113,7 @@ func New(options Options) (*ValkeyClusterManager, error) {
 	ValkeyClusterManager.podTemplate = options.PodTemplate
 	ValkeyClusterManager.valkeyVersion = options.ValkeyVersion
 	ValkeyClusterManager.valkeyConfigMapName = options.ValkeyConfigMapName
+	ValkeyClusterManager.valkeyPVCName = options.ValkeyPVCName
 	ValkeyClusterManager.config = options.Config
 	ValkeyClusterManager.ctx = context.Background()
 
@@ -228,7 +232,8 @@ func (c *ValkeyClusterManager) valkeyStatefulSetTemplate() appsv1.StatefulSet {
 	replications := c.replications
 	name := c.name
 	replicas := int32(masters + masters*replications)
-	return appsv1.StatefulSet{ObjectMeta: v1.ObjectMeta{
+
+	statefulSet := appsv1.StatefulSet{ObjectMeta: v1.ObjectMeta{
 		Name: name,
 		OwnerReferences: []v1.OwnerReference{
 			c.owner,
@@ -242,13 +247,34 @@ func (c *ValkeyClusterManager) valkeyStatefulSetTemplate() appsv1.StatefulSet {
 				},
 			},
 			Replicas: &replicas,
-			Template: c.valkeyPodTemplate(name),
+			Template: c.valkeyPodTemplate(),
 		},
 	}
+	if strings.EqualFold(c.valkeyPVCName, "") {
+		statefulSet.Spec.VolumeClaimTemplates = append(statefulSet.Spec.VolumeClaimTemplates,
+			corev1.PersistentVolumeClaim{
+				ObjectMeta: v1.ObjectMeta{
+					Name: name,
+				},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes: []corev1.PersistentVolumeAccessMode{
+						corev1.ReadWriteMany,
+					},
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("1Gi"),
+						},
+					},
+					StorageClassName: nil,
+				},
+			})
+	}
+	return statefulSet
 }
 
-func (c *ValkeyClusterManager) valkeyPodTemplate(name string) corev1.PodTemplateSpec {
+func (c *ValkeyClusterManager) valkeyPodTemplate() corev1.PodTemplateSpec {
 	podTemplate := c.podTemplate
+	name := c.name
 
 	if podTemplate.ObjectMeta.Labels == nil {
 		podTemplate.ObjectMeta.Labels = make(map[string]string)
@@ -260,8 +286,9 @@ func (c *ValkeyClusterManager) valkeyPodTemplate(name string) corev1.PodTemplate
 		valkeyVersion = "latest"
 	}
 
-	configFromConfigMap := !strings.EqualFold(c.valkeyConfigMapName, "")
 	valkeyConfigName := "valkey-config"
+
+	configFromConfigMap := !strings.EqualFold(c.valkeyConfigMapName, "")
 	if configFromConfigMap {
 		mode := int32(0644)
 		configVolume := corev1.Volume{
@@ -276,6 +303,19 @@ func (c *ValkeyClusterManager) valkeyPodTemplate(name string) corev1.PodTemplate
 			},
 		}
 		podTemplate.Spec.Volumes = append(podTemplate.Spec.Volumes, configVolume)
+	}
+	pvcFromPVCName := !strings.EqualFold(c.valkeyPVCName, "")
+	if pvcFromPVCName {
+		pvcVolume := corev1.Volume{
+			Name: name,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: c.valkeyPVCName,
+					ReadOnly:  false,
+				},
+			},
+		}
+		podTemplate.Spec.Volumes = append(podTemplate.Spec.Volumes, pvcVolume)
 	}
 	containerSpec :=
 		corev1.Container{
@@ -296,6 +336,45 @@ func (c *ValkeyClusterManager) valkeyPodTemplate(name string) corev1.PodTemplate
 					},
 				},
 			},
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					ReadOnly:  false,
+					Name:      name,
+					MountPath: "/data",
+				},
+			},
+			ReadinessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{
+							"/bin/bash",
+							"-c",
+							strings.Join([]string{
+								"valkey-cli",
+								"-p",
+								strconv.Itoa(int(c.port)),
+								"ping",
+							}, " "),
+						},
+					},
+				},
+			},
+			LivenessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{
+							"/bin/bash",
+							"-c",
+							strings.Join([]string{
+								"valkey-cli",
+								"-p",
+								strconv.Itoa(int(c.port)),
+								"ping",
+							}, " "),
+						},
+					},
+				},
+			},
 			Command: []string{"/bin/bash", "-c"},
 			Args: []string{
 				strings.Join([]string{
@@ -312,13 +391,12 @@ func (c *ValkeyClusterManager) valkeyPodTemplate(name string) corev1.PodTemplate
 			},
 		}
 	if configFromConfigMap {
-		containerSpec.VolumeMounts = []corev1.VolumeMount{
-			{
-				ReadOnly:  true,
-				Name:      valkeyConfigName,
-				MountPath: "/data",
-			},
-		}
+		containerSpec.VolumeMounts = append(containerSpec.VolumeMounts, corev1.VolumeMount{
+			ReadOnly:  false,
+			Name:      valkeyConfigName,
+			MountPath: "/data/nodes.conf",
+			SubPath:   "nodes.conf",
+		})
 	}
 	podTemplate.Spec.Containers = []corev1.Container{
 		containerSpec,
@@ -558,37 +636,6 @@ func parseValkeyClusterInfo(valkeyClusterInfo string) map[string]string {
 }
 
 func (c *ValkeyClusterManager) ScaleInMaster(masters int) error {
-	if false {
-		clusterState := c.GetClusterStatus()
-
-		state := clusterState.State
-		amountNodes := len(state)
-		for i := range masters {
-			podToBeScaledIn := fmt.Sprintf("%s-%d", c.name, amountNodes-i)
-			node, ok := state[podToBeScaledIn]
-			if !ok {
-				return fmt.Errorf("pod %s was not in valkey cluster", podToBeScaledIn)
-			}
-			_, err := c.valkeyClient.Do(
-				c.ctx,
-				c.
-					valkeyClient.
-					B().
-					ClusterForget().
-					NodeId(node.ID).
-					Build()).ToString()
-			if err != nil {
-				return err
-			}
-		}
-		newReplicas := *c.statefulSet.Spec.Replicas - int32(masters)
-		c.statefulSet.Spec.Replicas = &newReplicas
-		_, err := c.clientSet.
-			AppsV1().
-			StatefulSets(c.namespace).
-			Update(c.ctx, c.statefulSet, v1.UpdateOptions{})
-		return err
-	} //ToDo finish scale out logic
 	return nil
 }
 

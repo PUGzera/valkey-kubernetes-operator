@@ -109,6 +109,7 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	return ctrl.Result{}, nil
 }
 
+// ToDo: Fix onUpdate logic later
 func (r *ValkeyClusterReconciler) onUpdate(valkeyCluster *valkeyv1.ValkeyCluster) error {
 	prevConf := valkeyCluster.Status.PreviousConfig
 	if prevConf == nil {
@@ -231,6 +232,7 @@ func (r *ValkeyClusterReconciler) GenerateOptions(valkeyCluster *valkeyv1.Valkey
 		},
 		ValkeyVersion:       valkeyCluster.Spec.ValkeyVersion,
 		ValkeyConfigMapName: valkeyCluster.Spec.ValkeyConfigMapName,
+		ValkeyPVCName:       valkeyCluster.Spec.ValkeyPVCName,
 		Config:              r.Config,
 	}
 
