@@ -103,7 +103,9 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				valkeyCluster.Namespace,
 				valkeyCluster.Name,
 			))
+			return ctrl.Result{}, nil
 		}
+		delete(r.State[valkeyCluster.Namespace], valkeyCluster.Name)
 		return ctrl.Result{}, nil
 	}
 
@@ -210,7 +212,10 @@ func (r *ValkeyClusterReconciler) onCreate(valkeyCluster *valkeyv1.ValkeyCluster
 
 	cancelCtx, cancel := context.WithCancel(context.Background())
 
-	r.State[valkeyCluster.Namespace] = make(ValkeyNamespacedClusterMap)
+	if r.State[valkeyCluster.Namespace] == nil {
+		r.State[valkeyCluster.Namespace] = make(ValkeyNamespacedClusterMap)
+	}
+
 	r.State[valkeyCluster.Namespace][valkeyCluster.Name] = ValkeyCluster{
 		ClusterManager:         clusterManager,
 		ClusterCR:              valkeyCluster,
