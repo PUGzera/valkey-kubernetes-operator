@@ -86,7 +86,7 @@ type ValkeyClusterManager struct {
 	config              *rest.Config
 
 	clientSet    *kubernetes.Clientset
-	statefulSet  *appsv1.StatefulSet
+	statefulSets []*appsv1.StatefulSet
 	valkeyClient valkey.Client
 	available    bool
 	ctx          context.Context
@@ -124,10 +124,6 @@ func New(options Options) (*ValkeyClusterManager, error) {
 		return nil, err
 	}
 
-	if err := valkeyClusterManager.connectToCluster(); err != nil {
-		return nil, err
-	}
-
 	return valkeyClusterManager, nil
 }
 
@@ -145,22 +141,39 @@ func (c *ValkeyClusterManager) createCluster() error {
 	return nil
 }
 
-func (c *ValkeyClusterManager) getValkeyPodAddresses(withPort bool) ([]string, error) {
-	pods, err := c.getValkeyNodePods()
+func (c *ValkeyClusterManager) getValkeyPodAddressMap(withPort bool) (map[string][]string, error) {
+	pods, err := c.getValkeyNodePodsMap()
 	if err != nil {
 		return nil, err
 	}
 
-	addresses := make([]string, len(pods.Items))
-	for i, pod := range pods.Items {
-		address := c.getFQDNFromPodName(pod.Name)
-		if withPort {
-			address = address + ":" + strconv.Itoa(int(c.port))
+	addressMap := make(map[string][]string)
+	for statefulSet, podList := range pods {
+		addresses := make([]string, len(podList.Items))
+		for i, pod := range podList.Items {
+			address := c.getFQDNFromPodName(pod.Name)
+			if withPort {
+				address = address + ":" + strconv.Itoa(int(c.port))
+			}
+			addresses[i] = address
 		}
-		addresses[i] = address
+		addressMap[statefulSet] = addresses
 	}
 
-	return addresses, nil
+	return addressMap, nil
+}
+
+func (c *ValkeyClusterManager) getValkeyPodAddresses(withPort bool) ([]string, error) {
+	addressMap, err := c.getValkeyPodAddressMap(withPort)
+	if err != nil {
+		return nil, err
+	}
+	var ret []string
+	for _, addresses := range addressMap {
+		ret = append(ret, addresses...)
+	}
+
+	return ret, nil
 }
 
 func removePortFromAddress(address string) string {
@@ -171,45 +184,75 @@ func (c *ValkeyClusterManager) getFQDNFromPodName(podName string) string {
 	return fmt.Sprintf("%s.%s.%s.svc.cluster.local", podName, c.name, c.namespace)
 }
 
-func (c *ValkeyClusterManager) getValkeyNodePods() (*corev1.PodList, error) {
-	statefulSet := c.statefulSet
-	selector, ok := statefulSet.Spec.Selector.MatchLabels["app"]
-	if !ok {
-		return nil, errors.New("unable to get labelselector \"app\"")
+func (c *ValkeyClusterManager) getValkeyNodePodsMap() (map[string]*corev1.PodList, error) {
+	podsMap := make(map[string]*corev1.PodList)
+	for _, set := range c.statefulSets {
+		selector, ok := set.Spec.Selector.MatchLabels["app"]
+		if !ok {
+			return nil, fmt.Errorf("failed to find match label \"app\"")
+		}
+		pods, err := c.clientSet.
+			CoreV1().
+			Pods(c.namespace).
+			List(c.ctx, v1.ListOptions{LabelSelector: fmt.Sprintf("app=%s", selector)})
+		if err != nil {
+			return nil, err
+		}
+		if len(pods.Items) < 1 {
+			return nil, fmt.Errorf("no pods found with selector %s", selector)
+		}
+		podsMap[set.ObjectMeta.Name] = pods
 	}
-	return c.clientSet.
-		CoreV1().
-		Pods(c.namespace).
-		List(c.ctx, v1.ListOptions{LabelSelector: fmt.Sprintf("app=%s", selector)})
+	return podsMap, nil
+}
+
+func (c *ValkeyClusterManager) getValkeyNodePods() ([]corev1.Pod, error) {
+	podsMap, err := c.getValkeyNodePodsMap()
+	if err != nil {
+		return nil, err
+	}
+
+	var ret []corev1.Pod
+	for _, pods := range podsMap {
+		ret = append(ret, pods.Items...)
+	}
+
+	return ret, nil
 }
 
 func (c *ValkeyClusterManager) createValkeyClusterKubernetesResources() error {
-	statefulSetTemplate := c.valkeyStatefulSetTemplate()
+	for i := range c.masters {
+		statefulSet, err := c.createValkeyClusterStatefulSet(i)
+		if err != nil {
+			return nil
+		}
+		c.statefulSets = append(c.statefulSets, statefulSet)
+	}
+
 	serviceTemplate := c.valkeyServiceTemplate()
+	_, err := c.clientSet.
+		CoreV1().
+		Services(c.namespace).
+		Create(c.ctx, &serviceTemplate, v1.CreateOptions{})
+	return err
+}
+
+func (c *ValkeyClusterManager) createValkeyClusterStatefulSet(index int) (*appsv1.StatefulSet, error) {
+	statefulSetTemplate := c.valkeyStatefulSetTemplate(index)
 
 	statefulSet, err := c.clientSet.
 		AppsV1().
 		StatefulSets(c.namespace).
 		Create(c.ctx, &statefulSetTemplate, v1.CreateOptions{})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if err := c.waitForStatefulSetToBeReady(statefulSet, time.Minute*5); err != nil {
-		return err
+		return nil, err
 	}
 
-	_, err = c.clientSet.
-		CoreV1().
-		Services(c.namespace).
-		Create(c.ctx, &serviceTemplate, v1.CreateOptions{})
-	if err != nil {
-		return err
-	}
-
-	c.statefulSet = statefulSet
-
-	return nil
+	return statefulSet, nil
 }
 
 func (c *ValkeyClusterManager) waitForStatefulSetToBeReady(statefulset *appsv1.StatefulSet, timeout time.Duration) error {
@@ -230,11 +273,10 @@ func (c *ValkeyClusterManager) waitForStatefulSetToBeReady(statefulset *appsv1.S
 	})
 }
 
-func (c *ValkeyClusterManager) valkeyStatefulSetTemplate() appsv1.StatefulSet {
-	masters := c.masters
+func (c *ValkeyClusterManager) valkeyStatefulSetTemplate(index int) appsv1.StatefulSet {
 	replications := c.replications
-	name := c.name
-	replicas := int32(masters + masters*replications)
+	name := fmt.Sprintf("%s-%d", c.name, index)
+	replicas := int32(replications + 1)
 
 	statefulSet := appsv1.StatefulSet{ObjectMeta: v1.ObjectMeta{
 		Name: name,
@@ -243,14 +285,15 @@ func (c *ValkeyClusterManager) valkeyStatefulSetTemplate() appsv1.StatefulSet {
 		},
 	},
 		Spec: appsv1.StatefulSetSpec{
-			ServiceName: name,
+			ServiceName: c.name,
 			Selector: &v1.LabelSelector{
 				MatchLabels: map[string]string{
-					"app": name,
+					"app":     name,
+					"cluster": c.name,
 				},
 			},
 			Replicas: &replicas,
-			Template: c.valkeyPodTemplate(),
+			Template: c.valkeyPodTemplate(name),
 		},
 	}
 	if strings.EqualFold(c.valkeyPVCName, "") {
@@ -278,14 +321,14 @@ func (c *ValkeyClusterManager) valkeyStatefulSetTemplate() appsv1.StatefulSet {
 	return statefulSet
 }
 
-func (c *ValkeyClusterManager) valkeyPodTemplate() corev1.PodTemplateSpec {
+func (c *ValkeyClusterManager) valkeyPodTemplate(name string) corev1.PodTemplateSpec {
 	podTemplate := c.podTemplate
-	name := c.name
 
 	if podTemplate.ObjectMeta.Labels == nil {
 		podTemplate.ObjectMeta.Labels = make(map[string]string)
 	}
 	podTemplate.ObjectMeta.Labels["app"] = name
+	podTemplate.ObjectMeta.Labels["cluster"] = c.name
 
 	valkeyVersion := c.valkeyVersion
 	if strings.EqualFold(valkeyVersion, "") {
@@ -429,7 +472,7 @@ func (c *ValkeyClusterManager) valkeyServiceTemplate() corev1.Service {
 				},
 			},
 			Selector: map[string]string{
-				"app": name,
+				"cluster": name,
 			},
 			Type:      corev1.ServiceTypeClusterIP,
 			ClusterIP: "None",
@@ -438,17 +481,26 @@ func (c *ValkeyClusterManager) valkeyServiceTemplate() corev1.Service {
 }
 
 func (c *ValkeyClusterManager) createValkeyCluster() error {
-	pods, err := c.getValkeyNodePods()
-	if err != nil || len(pods.Items) < 1 {
-		return errors.New("failed to get valkey pods")
-	}
-
-	podName := pods.Items[0].Name
-
-	addresses, err := c.getValkeyPodAddresses(true)
+	pods, err := c.getValkeyNodePodsMap()
 	if err != nil {
-		return nil
+		return err
 	}
+
+	addressMap, err := c.getValkeyPodAddressMap(true)
+	if err != nil {
+		return err
+	}
+
+	var masterReplicaMap = make(map[string][]string)
+	var masterAddresses []string
+	for _, addresses := range addressMap {
+		masterAddress := addresses[0]
+		masterAddresses = append(masterAddresses, masterAddress)
+		masterReplicaMap[masterAddress] = addresses[1:]
+	}
+
+	name := fmt.Sprintf("%s-%d", c.name, 0)
+	podName := pods[name].Items[0].Name
 	_, _, err = c.execValkeyPod(
 		podName,
 		"--cluster",
@@ -456,27 +508,48 @@ func (c *ValkeyClusterManager) createValkeyCluster() error {
 			[]string{
 				"create",
 				"--cluster-yes",
-				"--cluster-replicas",
-				strconv.Itoa(c.replications),
 			},
-			addresses...))
-	return err
-}
-
-func (c *ValkeyClusterManager) connectToCluster() error {
-	addresses, err := c.getValkeyPodAddresses(true)
+			masterAddresses...))
 	if err != nil {
 		return err
 	}
 
 	client, err := valkey.NewClient(valkey.ClientOption{
-		InitAddress: addresses,
+		InitAddress: masterAddresses,
 		SendToReplicas: func(cmd valkey.Completed) bool {
 			return cmd.IsReadOnly()
 		},
 	})
 	if err != nil {
 		return err
+	}
+
+	clients := client.Nodes()
+	for masterAddress, replicaAddresses := range masterReplicaMap {
+		masterClient, ok := clients[masterAddress]
+		if !ok {
+			return fmt.Errorf("could not find master client for %s", masterAddress)
+		}
+		masterId, err := masterClient.Do(c.ctx, masterClient.B().ClusterMyid().Build()).ToString()
+		if err != nil {
+			return err
+		}
+		for _, replicaAddress := range replicaAddresses {
+			_, _, err = c.execValkeyPod(
+				podName,
+				"--cluster",
+				[]string{
+					"add-node",
+					replicaAddress,
+					masterAddress,
+					"--cluster-replica",
+					"--cluster-master-id",
+					masterId,
+				})
+			if err != nil {
+				return fmt.Errorf("failed adding node %s to %s with master id %s with error %s", replicaAddress, masterAddress, masterId, err.Error())
+			}
+		}
 	}
 
 	c.valkeyClient = client
@@ -642,10 +715,98 @@ func parseValkeyClusterInfo(valkeyClusterInfo string) map[string]string {
 }
 
 func (c *ValkeyClusterManager) ScaleInMaster(masters int) error {
+	if masters >= c.masters {
+		return fmt.Errorf("cluster only has %d masters, can't remove %d master", c.masters, masters)
+	}
+
+	statefulSets := c.statefulSets
+
+	if len(statefulSets) < 1 {
+		return errors.New("can't scale in as there are not masters in the cluster")
+	}
+
+	statefulSetToRemove := statefulSets[0]
+
+	addressMap, err := c.getValkeyPodAddressMap(true)
+	if err != nil {
+		return err
+	}
+
+	addresses, ok := addressMap[statefulSetToRemove.Name]
+	if !ok {
+		return fmt.Errorf("can't find node %s in address map", statefulSetToRemove.Name)
+	}
+
+	clients := c.valkeyClient.Nodes()
+	for _, address := range addresses {
+		nodeClient, ok := clients[address]
+		if !ok {
+			return fmt.Errorf("no client for address %s found", address)
+		}
+		id, err := nodeClient.Do(c.ctx, nodeClient.B().ClusterMyid().Build()).ToString()
+		if err != nil {
+			return err
+		}
+		for nodeAddress, client := range clients {
+			if !strings.EqualFold(nodeAddress, address) {
+				err := client.Do(c.ctx, client.B().ClusterForget().NodeId(id).Build()).Error()
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	err = c.clientSet.AppsV1().StatefulSets(c.namespace).Delete(c.ctx, statefulSetToRemove.Name, v1.DeleteOptions{})
+	if err != nil {
+		return err
+	}
+
+	c.statefulSets = statefulSets[1:]
 	return nil
 }
 
 func (c *ValkeyClusterManager) ScaleOutMaster(masters int) error {
+	pods, err := c.getValkeyNodePods()
+	if err != nil {
+		return err
+	}
+
+	podName := pods[0].Name
+	randomNode := fmt.Sprintf("%s:%d", c.getFQDNFromPodName(podName), c.port)
+	for i := range masters {
+		statefulSet, err := c.createValkeyClusterStatefulSet(len(c.statefulSets) - 1 + i)
+		if err != nil {
+			return err
+		}
+		addressMap, err := c.getValkeyPodAddressMap(true)
+		if err != nil {
+			return err
+		}
+		addresses, ok := addressMap[statefulSet.Name]
+		if !ok {
+			return fmt.Errorf("could not find addresses for statefulset %s", statefulSet.Name)
+		}
+		for i, address := range addresses {
+			flags := []string{
+				"add-node",
+				address,
+				randomNode,
+			}
+			if i > 0 {
+				flags = append(flags, "--cluster-replica")
+			}
+			_, _, err = c.execValkeyPod(
+				podName,
+				"--cluster",
+				flags)
+			if err != nil {
+				return fmt.Errorf("could not add %s to cluster %s", address, randomNode)
+			}
+		}
+		c.statefulSets = append(c.statefulSets, statefulSet)
+	}
+
 	return nil
 }
 

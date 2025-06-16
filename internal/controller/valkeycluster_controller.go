@@ -189,9 +189,15 @@ func (r *ValkeyClusterReconciler) onUpdate(valkeyCluster *valkeyv1.ValkeyCluster
 
 	masterDiff := currentConf.Masters - prevConf.Masters
 	if masterDiff < 0 {
-		state.ClusterManager.ScaleInMaster(masterDiff * -1)
+		err := state.ClusterManager.ScaleInMaster(masterDiff * -1)
+		if err != nil {
+			return err
+		}
 	} else if masterDiff > 0 {
-		state.ClusterManager.ScaleOutMaster(masterDiff)
+		err := state.ClusterManager.ScaleOutMaster(masterDiff)
+		if err != nil {
+			return err
+		}
 	}
 
 	replicaDiff := currentConf.Replications - prevConf.Replications
